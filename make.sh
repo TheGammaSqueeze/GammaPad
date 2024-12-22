@@ -1,1 +1,13 @@
-ARCH=arm64 /root/android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang -O3 gammapad.c
+ARCH=arm64 \
+/root/android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang \
+-O3 \
+retrogamepad2xbox_main.c \
+retrogamepad2xbox_globals.c \
+retrogamepad2xbox_signal.c \
+retrogamepad2xbox_abs.c \
+retrogamepad2xbox_shell.c \
+retrogamepad2xbox_maps.c \
+retrogamepad2xbox_fan.c \
+retrogamepad2xbox_analog.c \
+retrogamepad2xbox_mouse.c \
+-o rgp2xbox
