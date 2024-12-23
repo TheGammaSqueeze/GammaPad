@@ -47,10 +47,10 @@ int create_virtual_controller(int* fd_out)
     uidev.ff_effects_max = 32; /* how many effects we can handle at once. */
 
     /* Some default ABS ranges for typical sticks/triggers. */
-    uidev.absmin[ABS_X] = -32768;   uidev.absmax[ABS_X] = 32767;
-    uidev.absmin[ABS_Y] = -32768;   uidev.absmax[ABS_Y] = 32767;
-    uidev.absmin[ABS_Z]  = -32768;  uidev.absmax[ABS_Z]  = 32767;
-    uidev.absmin[ABS_RZ] = -32768;  uidev.absmax[ABS_RZ] = 32767;
+    uidev.absmin[ABS_X] = -1800;   uidev.absmax[ABS_X] = 1800;
+    uidev.absmin[ABS_Y] = -1800;   uidev.absmax[ABS_Y] = 1800;
+    uidev.absmin[ABS_Z]  = -1800;  uidev.absmax[ABS_Z]  = 1800;
+    uidev.absmin[ABS_RZ] = -1800;  uidev.absmax[ABS_RZ] = 1800;
     /* For triggers. */
     uidev.absmin[ABS_GAS]   = 0;    uidev.absmax[ABS_GAS]   = 255;
     uidev.absmin[ABS_BRAKE] = 0;    uidev.absmax[ABS_BRAKE] = 255;
