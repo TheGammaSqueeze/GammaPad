@@ -54,4 +54,9 @@ static inline unsigned long long getTimeMs(void)
  */
 extern int controllerFd;
 
+/*
+ * Also expose g_physicalFd so we can read absmin/absmax from the captured device.
+ */
+extern int g_physicalFd;
+
 #endif /* GAMMAPAD_H */

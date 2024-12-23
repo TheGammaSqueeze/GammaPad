@@ -7,10 +7,6 @@
 #include <fcntl.h>
 #include <signal.h>
 
-/*
- * We'll store active events for auto-reset. Minimal logs to keep performance.
- */
-
 #define MAX_ACTIVE_EVENTS 64
 #define EPOLL_MAX_EVENTS  16
 
@@ -36,6 +32,19 @@ int controllerFd = -1;
 int mouseFd      = -1;
 
 /*
+ * g_physicalFd is now declared without 'static' so other files can reference it.
+ */
+int g_physicalFd = -1; 
+
+static int g_shouldExit = 0;
+
+static void sigintHandler(int sig)
+{
+    (void)sig;
+    g_shouldExit = 1;
+}
+
+/*
  * Function prototypes 
  */
 int create_virtual_controller(int* fd_out);
@@ -48,27 +57,8 @@ void storeUploadedEffect(struct ff_effect* eff);
 void ff_play_effect(int kernel_id, int doPlay);
 void parseCommand(const char* line);
 
-/* 
- * We'll open the physical device in gammapad_capture.c => open_physical_device(),
- * so that code is not duplicated here.
- */
-
-static int g_physicalFd = -1; 
-static int g_shouldExit = 0;
-
-static void sigintHandler(int sig)
-{
-    (void)sig;
-    g_shouldExit = 1;
-}
-
-/*
- * We declare these locally, referencing the global "activeEvents" array.
- */
-
 static void sendEvent(int code, enum EventType t, int value, unsigned long long dur)
 {
-    // store in activeEvents for auto-reset
     for (int i = 0; i < MAX_ACTIVE_EVENTS; i++) {
         if (activeEvents[i].code == 0 && activeEvents[i].value == 0) {
             activeEvents[i].type = t;
@@ -80,7 +70,6 @@ static void sendEvent(int code, enum EventType t, int value, unsigned long long 
         }
     }
 
-    // Actually send the event to controllerFd
     if (controllerFd < 0) return;
 
     struct input_event ev[2];
@@ -102,13 +91,11 @@ static void sendEvent(int code, enum EventType t, int value, unsigned long long 
     write(controllerFd, ev, sizeof(ev));
 }
 
-/* Exposed so commands can do scheduleEvent(...) */
 void scheduleEvent(int code, int isKey, int value, unsigned long long durationMs)
 {
     sendEvent(code, (isKey ? EVENT_TYPE_KEY : EVENT_TYPE_ABS), value, durationMs);
 }
 
-/* resetEvent after duration expires */
 static void resetEvent(int code, enum EventType t)
 {
     if (controllerFd < 0) return;
@@ -132,7 +119,6 @@ static void resetEvent(int code, enum EventType t)
     write(controllerFd, ev, sizeof(ev));
 }
 
-/* checkEventTimeouts */
 static void checkEventTimeouts(void)
 {
     unsigned long long now = getTimeMs();
@@ -151,9 +137,6 @@ static void checkEventTimeouts(void)
     }
 }
 
-/*
- * handleFFRequest => EV_UINPUT => UI_FF_UPLOAD or UI_FF_ERASE
- */
 static void handleFFRequest(const struct input_event* ev)
 {
     if (!ev) return;
@@ -180,17 +163,11 @@ static void handleFFRequest(const struct input_event* ev)
     }
 }
 
-/*
- * handleFFPlayStop => EV_FF code=<kid>, value=1 => play, value=0 => stop
- */
 static void handleFFPlayStop(int kid, int doPlay)
 {
     ff_play_effect(kid, doPlay);
 }
 
-/*
- * processControllerFdEvent => read from controllerFd for EV_UINPUT or EV_FF
- */
 static void processControllerFdEvent(void)
 {
     struct input_event ie;
@@ -213,9 +190,6 @@ static void processControllerFdEvent(void)
     }
 }
 
-/*
- * processPhysicalDeviceEvent => read from g_physicalFd, forward
- */
 static void processPhysicalDeviceEvent(int physical_fd)
 {
     struct input_event ev;
@@ -228,14 +202,10 @@ static void processPhysicalDeviceEvent(int physical_fd)
         if (n==0) break;
         if ((size_t)n < sizeof(ev)) break;
 
-        // forward
         forward_physical_event(&ev);
     }
 }
 
-/*
- * processStdinEvent => read typed commands
- */
 static void processStdinEvent(void)
 {
     char line[256];
@@ -252,9 +222,6 @@ static void processStdinEvent(void)
     parseCommand(line);
 }
 
-/*
- * add_epoll_fd => helper
- */
 static void add_epoll_fd(int epfd, int fd)
 {
     if (fd<0) return;
@@ -272,11 +239,9 @@ int main(int argc, char** argv)
 {
     signal(SIGINT, sigintHandler);
 
-    // Create virtual controller
     if (create_virtual_controller(&controllerFd) <0) {
         return 1;
     }
-    // Create virtual mouse
     if (create_virtual_mouse(&mouseFd)<0){
         destroy_virtual_device(controllerFd);
         return 1;
@@ -284,7 +249,6 @@ int main(int argc, char** argv)
     fprintf(stderr,"GammaPad Virtual Controller (fd=%d)\n", controllerFd);
     fprintf(stderr,"GammaPad Virtual Mouse       (fd=%d)\n", mouseFd);
 
-    // If there's an argv[1], we attempt to open a physical device
     if (argc>1) {
         g_physicalFd = open_physical_device(argv[1]);
         if (g_physicalFd<0){
@@ -295,7 +259,6 @@ int main(int argc, char** argv)
         }
     }
 
-    // Setup epoll
     int epfd= epoll_create1(0);
     if (epfd<0){
         perror("epoll_create1");
@@ -335,7 +298,6 @@ int main(int argc, char** argv)
 
     while(!g_shouldExit) {
         checkEventTimeouts();
-
         int n= epoll_wait(epfd, events, EPOLL_MAX_EVENTS, 500);
         if (n<0) {
             if (errno==EINTR) continue;
@@ -362,7 +324,6 @@ int main(int argc, char** argv)
 
     close(epfd);
 
-    // cleanup
     if (g_physicalFd>=0){
         ioctl(g_physicalFd,EVIOCGRAB,0);
         close(g_physicalFd);

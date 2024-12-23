@@ -1,6 +1,34 @@
 #include "gammapad.h"
 #include "gammapad_inputdefs.h"
 
+/* We'll read from g_physicalFd if it's open. */
+extern int g_physicalFd;
+
+/*
+ * setAbsRange:
+ * -------------
+ * Try to read the ABS info from the physical device (if any).
+ * If that fails, use the fallback defaults.
+ */
+static void setAbsRange(struct uinput_user_dev *uidev,
+                        int axis, int defMin, int defMax)
+{
+    struct input_absinfo absinfo;
+    if (g_physicalFd >= 0 &&
+        ioctl(g_physicalFd, EVIOCGABS(axis), &absinfo) == 0)
+    {
+        uidev->absmin[axis]  = absinfo.minimum;
+        uidev->absmax[axis]  = absinfo.maximum;
+        uidev->absfuzz[axis] = absinfo.fuzz;
+        uidev->absflat[axis] = absinfo.flat;
+    }
+    else {
+        uidev->absmin[axis] = defMin;
+        uidev->absmax[axis] = defMax;
+        /* fuzz/flat remain zero by default. */
+    }
+}
+
 int create_virtual_controller(int* fd_out)
 {
     if (!fd_out) return -1;
@@ -46,17 +74,22 @@ int create_virtual_controller(int* fd_out)
     uidev.id.version = 0x0003;
     uidev.ff_effects_max = 32; /* how many effects we can handle at once. */
 
-    /* Some default ABS ranges for typical sticks/triggers. */
-    uidev.absmin[ABS_X] = -1800;   uidev.absmax[ABS_X] = 1800;
-    uidev.absmin[ABS_Y] = -1800;   uidev.absmax[ABS_Y] = 1800;
-    uidev.absmin[ABS_Z]  = -1800;  uidev.absmax[ABS_Z]  = 1800;
-    uidev.absmin[ABS_RZ] = -1800;  uidev.absmax[ABS_RZ] = 1800;
+    /*
+     * Some default ABS ranges for typical sticks/triggers,
+     * but we try to read the real device's range first.
+     */
+    setAbsRange(&uidev, ABS_X,   -1800, 1800);
+    setAbsRange(&uidev, ABS_Y,   -1800, 1800);
+    setAbsRange(&uidev, ABS_Z,   -1800, 1800);
+    setAbsRange(&uidev, ABS_RZ,  -1800, 1800);
+
     /* For triggers. */
-    uidev.absmin[ABS_GAS]   = 0;    uidev.absmax[ABS_GAS]   = 255;
-    uidev.absmin[ABS_BRAKE] = 0;    uidev.absmax[ABS_BRAKE] = 255;
+    setAbsRange(&uidev, ABS_GAS,   0, 255);
+    setAbsRange(&uidev, ABS_BRAKE, 0, 255);
+
     /* D-pad as hat. */
-    uidev.absmin[ABS_HAT0X] = -1;   uidev.absmax[ABS_HAT0X] = 1;
-    uidev.absmin[ABS_HAT0Y] = -1;   uidev.absmax[ABS_HAT0Y] = 1;
+    setAbsRange(&uidev, ABS_HAT0X, -1, 1);
+    setAbsRange(&uidev, ABS_HAT0Y, -1, 1);
 
     if (write(fd, &uidev, sizeof(uidev)) < 0) {
         close(fd);
