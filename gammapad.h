@@ -20,7 +20,7 @@
  * If you want more logs, compile with -DGAMMAPAD_VERBOSE_LOGGING=1
  */
 #ifndef GAMMAPAD_VERBOSE_LOGGING
-#define GAMMAPAD_VERBOSE_LOGGING 0
+#define GAMMAPAD_VERBOSE_LOGGING 1
 #endif
 
 /* Logging macro for Force Feedback if verbose logging is enabled. */
