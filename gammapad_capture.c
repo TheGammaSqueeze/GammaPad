@@ -13,7 +13,7 @@ extern int controllerFd;
 
 /*
  * We'll store:
- *   - The identified driver path (e.g. "/sys/bus/platform/drivers/retrogame_joypad")
+ *   - The identified driver path (e.g. "/sys/bus/platform/drivers/singleadc-joypad")
  *   - The real device name (e.g. "singleadc-joypad")
  *   - Whether we successfully identified them => gHasDriver=1
  */
@@ -142,7 +142,9 @@ static int tryLsDriverPath(const char* evName,
     }
     pclose(fp);
 
-    /* Example: "lrwxrwxrwx 1 root root 0 2023-12-01 12:00 driver -> ../../bus/platform/drivers/retrogame_joypad" */
+    /* Example:
+       "lrwxrwxrwx 1 root root 0 2023-12-01 12:00 driver -> ../../bus/platform/drivers/retrogame_joypad"
+    */
     const char* arrow = strstr(line, "-> ");
     if (!arrow) return -1;
     arrow += 3; // skip "-> "
@@ -199,7 +201,7 @@ static int identifyDriverAndDevice(const char* eventNode,
         }
     }
 
-    /* Step 2: readlink -f => e.g. "/sys/class/input/event4/device" => "/sys/devices/platform/singleadc-joypad/input/input183" */
+    /* Step 2: readlink -f => e.g. "/sys/class/input/<evBase>/device" */
     char deviceSymlink[512];
     snprintf(deviceSymlink, sizeof(deviceSymlink),
              "/sys/class/input/%s/device", evBase);
@@ -287,11 +289,92 @@ static void unbindAndRebind(void)
 }
 
 /*
+ * We'll handle collisions here so that scancode=2 or 5 overshadow scancode=9 or 10
+ * if they map to the same final axis code, etc.
+ */
+static void resolveAxisCollisions(void)
+{
+    /*
+     * We'll track which final axes are "taken," storing which scancode
+     * claimed them + that scancode's range. Then if another scancode
+     * tries to claim the same final axis, we do a priority check:
+     *   1) if sc==2 or sc==5 => triggers overshadow non-triggers
+     *   2) else pick whichever has bigger range
+     */
+    struct {
+        int scancode;
+        int range; 
+    } finalUsed[ABS_MAX+1];
+
+    for (int i=0; i<=ABS_MAX; i++){
+        finalUsed[i].scancode = -1;
+        finalUsed[i].range    = 0;
+    }
+
+    for (int sc=0; sc<=ABS_MAX; sc++){
+        if (!g_discoveredAxes[sc]) continue;
+        int finalAxis = g_absMap[sc];
+        if (finalAxis<0 || finalAxis>ABS_MAX) continue;
+
+        int range = g_physicalAbsMax[sc] - g_physicalAbsMin[sc];
+        if (range < 0) range = -range;
+
+        if (finalUsed[finalAxis].scancode < 0) {
+            // Not used => take it
+            finalUsed[finalAxis].scancode = sc;
+            finalUsed[finalAxis].range    = range;
+        } else {
+            // collision => check priorities
+            int oldSc    = finalUsed[finalAxis].scancode;
+            int oldRange = finalUsed[finalAxis].range;
+
+            // We'll consider sc=2 or sc=5 "real triggers"
+            int isNewTrigger = ((sc == 2) || (sc == 5));
+            int isOldTrigger = ((oldSc == 2) || (oldSc == 5));
+
+            if (!isOldTrigger && isNewTrigger) {
+                // new sc is sc=2 or sc=5 => overshadow old sc
+                finalUsed[finalAxis].scancode = sc;
+                finalUsed[finalAxis].range    = range;
+                g_discoveredAxes[oldSc] = 0;
+                g_absMap[oldSc]         = -1;
+                fprintf(stderr,"[Capture] collision: finalAxis=%d oldSc=%d replaced by real trigger sc=%d\n",
+                    finalAxis, oldSc, sc);
+            }
+            else if (isOldTrigger && !isNewTrigger) {
+                // old sc=2 or 5 => overshadow sc
+                g_discoveredAxes[sc] = 0;
+                g_absMap[sc]         = -1;
+                fprintf(stderr,"[Capture] collision: finalAxis=%d sc=%d overshadowed by old real trigger sc=%d\n",
+                    finalAxis, sc, oldSc);
+            } else {
+                // both triggers or both not triggers => pick bigger range
+                if (range > oldRange) {
+                    finalUsed[finalAxis].scancode = sc;
+                    finalUsed[finalAxis].range    = range;
+                    g_discoveredAxes[oldSc] = 0;
+                    g_absMap[oldSc]         = -1;
+                    fprintf(stderr,"[Capture] collision: finalAxis=%d oldSc=%d replaced by sc=%d w/ bigger range\n",
+                        finalAxis, oldSc, sc);
+                } else {
+                    // keep old => unmap sc
+                    g_discoveredAxes[sc] = 0;
+                    g_absMap[sc]         = -1;
+                    fprintf(stderr,"[Capture] collision: finalAxis=%d sc=%d overshadowed by old sc=%d w/ bigger range\n",
+                        finalAxis, sc, oldSc);
+                }
+            }
+        }
+    }
+}
+
+/*
  * open_physical_device:
  *   1) parse the driver path & device name from sysfs
  *   2) open + grab the device
  *   3) parse .kl + discover keys+axes
- *   4) store the path => destructor can remove it at exit
+ *   4) call resolveAxisCollisions() => ensure triggers not overshadowed
+ *   5) store the path => destructor can remove it at exit
  */
 int open_physical_device(const char* device_path)
 {
@@ -342,6 +425,11 @@ int open_physical_device(const char* device_path)
     discoverKeys(fd);
     discoverAxes(fd);
 
+    /*
+     * Now fix collisions so that sc=2 or sc=5 overshadow sc=9 or sc=10, etc.
+     */
+    resolveAxisCollisions();
+
     /* Attempt to EVIOCGRAB => exclusive access. Even if it fails, continue. */
     if (ioctl(fd, EVIOCGRAB, 1) < 0) {
         fprintf(stderr, "[GammaPadCapture] EVIOCGRAB on %s failed: %s\n",
@@ -372,7 +460,7 @@ void forward_physical_event(const struct input_event* ev)
             orig, mapped, ev->value);
 
         struct input_event out[2];
-        memset(out, 0, sizeof(out));
+        memset(&out, 0, sizeof(out));
 
         out[0].type  = EV_KEY;
         out[0].code  = mapped;
@@ -387,11 +475,17 @@ void forward_physical_event(const struct input_event* ev)
         if (orig < 0 || orig > ABS_MAX) return;
         int mapped = g_absMap[orig];
 
+        /* Some extra debug for triggers: e.g. scancode=2 => final=9. */
         fprintf(stderr,"[FWD] ABS scancode=%d => final=%d, value=%d\n",
             orig, mapped, ev->value);
 
+        if (mapped < 0) {
+            /* means we pruned it from collision => do nothing. */
+            return;
+        }
+
         struct input_event out[2];
-        memset(out, 0, sizeof(out));
+        memset(&out, 0, sizeof(out));
 
         out[0].type  = EV_ABS;
         out[0].code  = mapped;
@@ -424,10 +518,6 @@ static void onFinish(void)
     unbindAndRebind();
 }
 
-/****************************************************************************
- * parse_android_keylayout_file_if_needed, parseKeyLayoutLine, discoverKeys,
- * discoverAxes => same as "latest good state." 
- ****************************************************************************/
 #ifdef __ANDROID__
 void parse_android_keylayout_file_if_needed(int fd)
 {
@@ -465,6 +555,10 @@ void parse_android_keylayout_file_if_needed(int fd)
 }
 #endif
 
+/*
+ * parseKeyLayoutLine => scancode => final code from .kl.
+ * If LTRIGGER => sc=2 => final=ABS_GAS or ABS_BRAKE, etc.
+ */
 void parseKeyLayoutLine(const char* line)
 {
     char type[32], sCode[32], name[32], rest[128];
@@ -479,13 +573,13 @@ void parseKeyLayoutLine(const char* line)
     }
     if (!strcasecmp(type, "key")) {
         int scancode = 0;
-        if (strncasecmp(sCode,"0x",2)==0) {
+        if (!strncasecmp(sCode,"0x",2)) {
             scancode = (int)strtol(sCode,NULL,16);
         } else {
             scancode = atoi(sCode);
         }
         if (scancode>=0 && scancode<=KEY_MAX) {
-            if (!strcasecmp(name,"BUTTON_A")) g_keyMap[scancode]= BTN_A;
+            if (!strcasecmp(name,"BUTTON_A"))      g_keyMap[scancode]= BTN_A;
             else if (!strcasecmp(name,"BUTTON_B")) g_keyMap[scancode]= BTN_B;
             else if (!strcasecmp(name,"BUTTON_X")) g_keyMap[scancode]= BTN_X;
             else if (!strcasecmp(name,"BUTTON_Y")) g_keyMap[scancode]= BTN_Y;
@@ -495,23 +589,23 @@ void parseKeyLayoutLine(const char* line)
                 sCode,name,scancode,g_keyMap[scancode]);
         }
     }
-    else if (!strcasecmp(type,"axis")) {
+    else if (!strcasecmp(type, "axis")) {
         int scancode=0;
-        if (strncasecmp(sCode,"0x",2)==0) {
+        if (!strncasecmp(sCode,"0x",2)) {
             scancode= (int)strtol(sCode,NULL,16);
         } else {
             scancode= atoi(sCode);
         }
         if (scancode>=0 && scancode<=ABS_MAX) {
-            if (!strcasecmp(name,"X"))        g_absMap[scancode]= ABS_X;
-            else if (!strcasecmp(name,"Y"))   g_absMap[scancode]= ABS_Y;
-            else if (!strcasecmp(name,"Z"))   g_absMap[scancode]= ABS_Z;
-            else if (!strcasecmp(name,"RZ"))  g_absMap[scancode]= ABS_RZ;
-            else if (!strcasecmp(name,"LTRIGGER")) g_absMap[scancode]= ABS_GAS;
-            else if (!strcasecmp(name,"RTRIGGER")) g_absMap[scancode]= ABS_BRAKE;
-            else if (!strcasecmp(name,"HAT_X"))     g_absMap[scancode]= ABS_HAT0X;
-            else if (!strcasecmp(name,"HAT_Y"))     g_absMap[scancode]= ABS_HAT0Y;
-            /* etc. fallback => scancode => scancode */
+            if (!strcasecmp(name,"X"))        g_absMap[scancode] = ABS_X;
+            else if (!strcasecmp(name,"Y"))   g_absMap[scancode] = ABS_Y;
+            else if (!strcasecmp(name,"Z"))   g_absMap[scancode] = ABS_Z;
+            else if (!strcasecmp(name,"RZ"))  g_absMap[scancode] = ABS_RZ;
+            else if (!strcasecmp(name,"LTRIGGER")) g_absMap[scancode] = ABS_GAS;   // or ABS_BRAKE
+            else if (!strcasecmp(name,"RTRIGGER")) g_absMap[scancode] = ABS_BRAKE; // or ABS_GAS
+            else if (!strcasecmp(name,"HAT_X"))     g_absMap[scancode] = ABS_HAT0X;
+            else if (!strcasecmp(name,"HAT_Y"))     g_absMap[scancode] = ABS_HAT0Y;
+            /* fallback => scancode => scancode if not recognized */
 
             fprintf(stderr,"[KL] 'axis %s %s' => scancode=%d => finalAbs=%d\n",
                 sCode,name,scancode,g_absMap[scancode]);
