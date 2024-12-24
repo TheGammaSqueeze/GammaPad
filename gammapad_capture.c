@@ -13,7 +13,7 @@ extern int controllerFd;
 
 /*
  * We'll store:
- *   - The identified driver path (e.g. "/sys/bus/platform/drivers/singleadc-joypad")
+ *   - The identified driver path (e.g. "/sys/bus/platform/drivers/retrogame_joypad")
  *   - The real device name (e.g. "singleadc-joypad")
  *   - Whether we successfully identified them => gHasDriver=1
  */
@@ -289,7 +289,7 @@ static void unbindAndRebind(void)
 }
 
 /*
- * We'll handle collisions here so that scancode=2 or 5 overshadow scancode=9 or 10
+ * We'll handle collisions here so that scancode=2 or scancode=5 overshadow scancode=9 or 10
  * if they map to the same final axis code, etc.
  */
 static void resolveAxisCollisions(void)
@@ -328,7 +328,7 @@ static void resolveAxisCollisions(void)
             int oldSc    = finalUsed[finalAxis].scancode;
             int oldRange = finalUsed[finalAxis].range;
 
-            // We'll consider sc=2 or sc=5 "real triggers"
+            // We'll consider sc=2 or sc=5 "real triggers" with 0..16384
             int isNewTrigger = ((sc == 2) || (sc == 5));
             int isOldTrigger = ((oldSc == 2) || (oldSc == 5));
 
@@ -387,7 +387,6 @@ int open_physical_device(const char* device_path)
         return -1;
     }
 
-    /* Attempt to identify driver => store gHasDriver=1 if success. */
     if (identifyDriverAndDevice(
             device_path,
             g_driverPath, sizeof(g_driverPath),
@@ -401,11 +400,9 @@ int open_physical_device(const char* device_path)
         gHasDriver = 0;
     }
 
-    /* store the device path => so destructor can remove node at exit */
     memset(g_physicalDevicePath,0,sizeof(g_physicalDevicePath));
     strncpy(g_physicalDevicePath, device_path, sizeof(g_physicalDevicePath)-1);
 
-    /* init scancode => final code arrays => identity transform by default */
     for (int i=0; i<=KEY_MAX; i++){
         g_keyMap[i] = i;
         g_discoveredKeys[i] = 0;
@@ -421,16 +418,10 @@ int open_physical_device(const char* device_path)
     parse_android_keylayout_file_if_needed(fd);
 #endif
 
-    /* discover which keys and axes exist, plus axis min/max */
     discoverKeys(fd);
     discoverAxes(fd);
-
-    /*
-     * Now fix collisions so that sc=2 or sc=5 overshadow sc=9 or sc=10, etc.
-     */
     resolveAxisCollisions();
 
-    /* Attempt to EVIOCGRAB => exclusive access. Even if it fails, continue. */
     if (ioctl(fd, EVIOCGRAB, 1) < 0) {
         fprintf(stderr, "[GammaPadCapture] EVIOCGRAB on %s failed: %s\n",
                 device_path, strerror(errno));
@@ -455,7 +446,6 @@ void forward_physical_event(const struct input_event* ev)
         if (orig < 0 || orig > KEY_MAX) return;
         int mapped = g_keyMap[orig];
 
-        /* Add a debug log => see the transform. */
         fprintf(stderr,"[FWD] KEY scancode=%d => final=%d, value=%d\n",
             orig, mapped, ev->value);
 
@@ -475,12 +465,11 @@ void forward_physical_event(const struct input_event* ev)
         if (orig < 0 || orig > ABS_MAX) return;
         int mapped = g_absMap[orig];
 
-        /* Some extra debug for triggers: e.g. scancode=2 => final=9. */
         fprintf(stderr,"[FWD] ABS scancode=%d => final=%d, value=%d\n",
             orig, mapped, ev->value);
 
         if (mapped < 0) {
-            /* means we pruned it from collision => do nothing. */
+            // pruned from collision => do nothing
             return;
         }
 
@@ -498,23 +487,19 @@ void forward_physical_event(const struct input_event* ev)
 }
 
 /*
- * We'll call unbindAndRebind() plus remove the node automatically at
- * program exit => destructor.
+ * destructor => remove node + unbind/rebind at program exit
  */
 __attribute__((destructor))
 static void onFinish(void)
 {
     fprintf(stderr, "[GammaPadCapture] onFinish() => removing node + unbind/rebind.\n");
 
-    /* remove the node if we stored a path. */
     if (g_physicalDevicePath[0]) {
         char rmCmd[300];
         snprintf(rmCmd, sizeof(rmCmd), "rm -f '%s'", g_physicalDevicePath);
         fprintf(stderr, "[GammaPadCapture] destructor => remove node => %s\n", rmCmd);
         system(rmCmd);
     }
-
-    /* do unbindAndRebind if we have a valid driver path + name. */
     unbindAndRebind();
 }
 
@@ -556,8 +541,8 @@ void parse_android_keylayout_file_if_needed(int fd)
 #endif
 
 /*
- * parseKeyLayoutLine => scancode => final code from .kl.
- * If LTRIGGER => sc=2 => final=ABS_GAS or ABS_BRAKE, etc.
+ * parseKeyLayoutLine => "no swapping" means:
+ * LTRIGGER => ABS_BRAKE, RTRIGGER => ABS_GAS
  */
 void parseKeyLayoutLine(const char* line)
 {
@@ -583,7 +568,7 @@ void parseKeyLayoutLine(const char* line)
             else if (!strcasecmp(name,"BUTTON_B")) g_keyMap[scancode]= BTN_B;
             else if (!strcasecmp(name,"BUTTON_X")) g_keyMap[scancode]= BTN_X;
             else if (!strcasecmp(name,"BUTTON_Y")) g_keyMap[scancode]= BTN_Y;
-            /* etc. fallback => scancode=>scancode if not recognized */
+            /* fallback => scancode=>scancode if not recognized */
 
             fprintf(stderr,"[KL] 'key %s %s' => scancode=%d => final=%d\n",
                 sCode,name,scancode,g_keyMap[scancode]);
@@ -597,15 +582,15 @@ void parseKeyLayoutLine(const char* line)
             scancode= atoi(sCode);
         }
         if (scancode>=0 && scancode<=ABS_MAX) {
-            if (!strcasecmp(name,"X"))        g_absMap[scancode] = ABS_X;
-            else if (!strcasecmp(name,"Y"))   g_absMap[scancode] = ABS_Y;
-            else if (!strcasecmp(name,"Z"))   g_absMap[scancode] = ABS_Z;
-            else if (!strcasecmp(name,"RZ"))  g_absMap[scancode] = ABS_RZ;
-            else if (!strcasecmp(name,"LTRIGGER")) g_absMap[scancode] = ABS_GAS;   // or ABS_BRAKE
-            else if (!strcasecmp(name,"RTRIGGER")) g_absMap[scancode] = ABS_BRAKE; // or ABS_GAS
+            if (!strcasecmp(name,"X"))         g_absMap[scancode] = ABS_X;
+            else if (!strcasecmp(name,"Y"))    g_absMap[scancode] = ABS_Y;
+            else if (!strcasecmp(name,"Z"))    g_absMap[scancode] = ABS_Z;
+            else if (!strcasecmp(name,"RZ"))   g_absMap[scancode] = ABS_RZ;
+            else if (!strcasecmp(name,"LTRIGGER")) g_absMap[scancode] = ABS_BRAKE;  // no swap
+            else if (!strcasecmp(name,"RTRIGGER")) g_absMap[scancode] = ABS_GAS;    // no swap
             else if (!strcasecmp(name,"HAT_X"))     g_absMap[scancode] = ABS_HAT0X;
             else if (!strcasecmp(name,"HAT_Y"))     g_absMap[scancode] = ABS_HAT0Y;
-            /* fallback => scancode => scancode if not recognized */
+            /* fallback => scancode => scancode */
 
             fprintf(stderr,"[KL] 'axis %s %s' => scancode=%d => finalAbs=%d\n",
                 sCode,name,scancode,g_absMap[scancode]);
