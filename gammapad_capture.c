@@ -348,7 +348,7 @@ static void resolveAxisCollisions(void)
  * aggregator approach => merges discovered scancodes from each device
  * For keys => if the scancode is *not* discovered, adopt it. If it
  * *is* discovered, we only override if the new device is primary
- * and the old one wasn't. 
+ * and the old one wasn't.
  */
 static void mergeKeysIntoGlobal(const int inKeys[KEY_MAX+1], int isPrimary)
 {
@@ -454,6 +454,7 @@ void discoverKeys(int fd, int isPrimary)
 {
     int singleKeys[KEY_MAX+1];
     memset(singleKeys,0,sizeof(singleKeys));
+
     discoverSingleDeviceKeys(fd, singleKeys);
     mergeKeysIntoGlobal(singleKeys, isPrimary);
 }
@@ -473,6 +474,7 @@ void discoverAxes(int fd)
 
 /*
  * parse_android_keylayout_file_if_needed => called once per device
+ * If .kl is not found or empty, scancode => scancode is kept as fallback.
  */
 #ifdef __ANDROID__
 void parse_android_keylayout_file_if_needed(int fd)
@@ -489,10 +491,11 @@ void parse_android_keylayout_file_if_needed(int fd)
 
         FILE* f= fopen(klPath,"r");
         if(!f){
-            fprintf(stderr,"[KL] no .kl => %s\n", klPath);
+            /* NO .kl => do nothing, fallback sc => sc. */
+            fprintf(stderr,"[KL] no .kl => %s => skipping.\n", klPath);
             return;
         }
-        fprintf(stderr,"[KL] found => %s\n", klPath);
+        fprintf(stderr,"[KL] found => %s => parsing lines...\n", klPath);
 
         char line[256];
         while(fgets(line,sizeof(line),f)){
@@ -535,7 +538,7 @@ void parseKeyLayoutLine(const char* line)
 
     if(!strcasecmp(type,"key")){
         if(sc>KEY_MAX) return;
-        int final= sc; // fallback
+        int final= sc; // fallback => sc => sc
         // Additional recognized names => final codes:
         if(!strcasecmp(name,"BUTTON_A"))        final= BTN_A;
         else if(!strcasecmp(name,"BUTTON_B"))   final= BTN_B;
@@ -569,7 +572,7 @@ void parseKeyLayoutLine(const char* line)
     }
     else if(!strcasecmp(type,"axis")){
         if(sc>ABS_MAX) return;
-        int final= sc; // fallback
+        int final= sc; // fallback => sc => sc
         if(!strcasecmp(name,"X"))           final= ABS_X;
         else if(!strcasecmp(name,"Y"))      final= ABS_Y;
         else if(!strcasecmp(name,"Z"))      final= ABS_Z;
@@ -603,6 +606,8 @@ void removePrimaryPhysicalNode(void)
 
 /*
  * open_physical_device => aggregator approach
+ *   - We also initialize g_keyMap[sc] = sc and g_absMap[sc] = sc for fallback
+ *     so if no .kl is found, the scancode remains sc => sc.
  */
 int open_physical_device(const char* device_path)
 {
@@ -633,6 +638,19 @@ int open_physical_device(const char* device_path)
         strncpy(g_physicalDevicePath, device_path, sizeof(g_physicalDevicePath)-1);
     }
 
+    /* Initialize fallback sc => sc for all possible scancodes,
+       so if we find no .kl or no lines for a sc, it remains sc => sc. */
+    for(int k=0; k<=KEY_MAX; k++){
+        if(!g_discoveredKeys[k]){ 
+            g_keyMap[k] = k; 
+        }
+    }
+    for(int a=0; a<=ABS_MAX; a++){
+        if(!g_discoveredAxes[a]){
+            g_absMap[a] = a;
+        }
+    }
+
 #ifdef __ANDROID__
     parse_android_keylayout_file_if_needed(fd);
 #endif
@@ -640,6 +658,30 @@ int open_physical_device(const char* device_path)
     discoverKeys(fd, isPrimary);
     discoverAxes(fd);
     resolveAxisCollisions();
+
+    /* Re-apply fallback sc => sc for any scancodes that .kl didn't map. 
+       We'll do this AFTER collisions so that overshadowed scancodes can remain -1 if needed. */
+    for(int sc=0; sc<=KEY_MAX; sc++){
+        if(g_discoveredKeys[sc]){
+            /* If g_keyMap[sc] <= 0 => not assigned => fallback => sc
+               except sc=0 can be a valid code => e.g. KEY_RESERVED => let's skip that. 
+               We'll skip if parseKeyLayoutLine set it to something > 0. */
+            if(g_keyMap[sc] <= 0){
+                g_keyMap[sc] = sc;
+            }
+        }
+    }
+    for(int sc=0; sc<=ABS_MAX; sc++){
+        if(g_discoveredAxes[sc]){
+            if(g_absMap[sc] < 0){
+                /* overshadowed => keep -1 => means "ignore" */
+            } else if(g_absMap[sc] == 0 && sc!=0){
+                /* if it's 0 but sc!=0 => fallback => sc. 
+                   (sc=0 is often ABS_X => that's valid. ) */
+                g_absMap[sc] = sc;
+            }
+        }
+    }
 
     if(ioctl(fd, EVIOCGRAB,1)<0){
         fprintf(stderr,"[GammaPadCapture] EVIOCGRAB => %s\n", strerror(errno));

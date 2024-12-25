@@ -132,8 +132,8 @@ int create_virtual_controller(int* fd_out)
 
     snprintf(uidev.name, UINPUT_MAX_NAME_SIZE, "GammaPad Virtual Controller");
     uidev.id.bustype= BUS_USB;
-    uidev.id.vendor= 0x045e;
-    uidev.id.product=0x02fd;
+    uidev.id.vendor= 0x0000;
+    uidev.id.product=0x0000;
     uidev.id.version=0x0003;
     uidev.ff_effects_max= 32;
 
