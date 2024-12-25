@@ -544,9 +544,6 @@ int main(int argc, char** argv)
     destroy_virtual_device(mouseFd);
     destroy_virtual_device(controllerFd);
 
-    /* Attempt unbind/bind again here so it definitely happens before we exit */
-    cleanupOnExit();
-
     fprintf(stderr,"[GammaPad] Exiting.\n");
     return 0;
 }
