@@ -86,7 +86,7 @@ static void toggleMotorRepeatedly(unsigned int durationMs, unsigned int magnitud
             fprintf(fOn,"1\n");
             fclose(fOn);
         }
-        usleep(sleepUs);
+        usleep(sleepUs*0.9);
         /* turn motor OFF */
         FILE* fOff= fopen(VIB_PATH,"w");
         if(fOff){
@@ -157,16 +157,18 @@ void storeUploadedEffect(struct ff_effect* eff)
     gEffects[idx].kernel_id= kid;
 
     unsigned int mag=0;
+    int isSmallMotor = 0;
     switch(eff->type){
     case FF_RUMBLE:{
         unsigned int smallMotor= eff->u.rumble.weak_magnitude/2;
-        unsigned int largeMotor= eff->u.rumble.strong_magnitude/3;
+        unsigned int largeMotor= eff->u.rumble.strong_magnitude/20;
         if(largeMotor>0 && smallMotor>0){
             mag= largeMotor;
         } else if(largeMotor>0){
             mag= largeMotor;
         } else {
             mag= smallMotor;
+            isSmallMotor = 1;
         }
         break;
     }
@@ -190,7 +192,8 @@ void storeUploadedEffect(struct ff_effect* eff)
     }
 
     gEffects[idx].magnitude= mag;
-    gEffects[idx].durationMs= eff->replay.length;
+    gEffects[idx].durationMs= eff->replay.length/2;
+    if (isSmallMotor == 1) {gEffects[idx].durationMs= eff->replay.length/4;}
     gEffects[idx].ffType= eff->type;
 
     LOG_FF("[FF] Stored => slot=%d, mag=%u, dur=%u, type=%u\n",
