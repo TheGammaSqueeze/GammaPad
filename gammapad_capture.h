@@ -17,17 +17,20 @@ int open_physical_device(const char* device_path);
 void forward_physical_event(const struct input_event* ev);
 
 /*
- * In case other files need them, add function prototypes:
- * parse_android_keylayout_file_if_needed, parseKeyLayoutLine, discoverKeys, discoverAxes.
- * That way, the compiler knows their signatures *before* they're called in .c
+ * parse_android_keylayout_file_if_needed, parseKeyLayoutLine
+ * used to handle .kl parsing for each device.
  */
 #ifdef __ANDROID__
 void parse_android_keylayout_file_if_needed(int fd);
 #endif
-
 void parseKeyLayoutLine(const char* line);
 
-void discoverKeys(int fd);
+/*
+ * aggregator discover => merges scancodes from physical devices
+ *   - The first device is "primary" =>  discoverKeys(fd, 1)
+ *   - Subsequent devices => discoverKeys(fd, 0)
+ */
+void discoverKeys(int fd, int isPrimary);
 void discoverAxes(int fd);
 
 /*
@@ -35,5 +38,18 @@ void discoverAxes(int fd);
  */
 int getPhysicalAbsMin(int scancode);
 int getPhysicalAbsMax(int scancode);
+
+/*
+ * removePrimaryPhysicalNode():
+ *   Called AFTER we create the virtual pad, so we can do
+ *   "rm -f /dev/input/eventX" for the primary device. 
+ */
+void removePrimaryPhysicalNode(void);
+
+/*
+ * We'll also expose a function to run unbindAndRebind at exit 
+ * so it can be called from both the destructor and gammapad_main.
+ */
+void unbindAndRebind(void);
 
 #endif // GAMMAPAD_CAPTURE_H

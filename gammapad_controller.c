@@ -1,3 +1,12 @@
+/*****************************************************
+ * gammapad_controller.c
+ *
+ * Creates the virtual controller (via /dev/uinput)
+ * using all discovered scancodes from aggregator
+ * logic in gammapad_capture.c. Also sets up force-
+ * feedback bits (advertise FF_RUMBLE, FF_CONSTANT, etc.).
+ *****************************************************/
+
 #include "gammapad.h"
 #include "gammapad_inputdefs.h"
 #include <errno.h>
@@ -11,7 +20,7 @@ extern int g_absMap[ABS_MAX+1];
 extern int getPhysicalAbsMin(int scancode);
 extern int getPhysicalAbsMax(int scancode);
 
-/* We'll read from g_physicalFd if it's open. */
+/* We'll read from g_physicalFd if it's open. (legacy leftover) */
 extern int g_physicalFd;
 
 /*
@@ -20,25 +29,21 @@ extern int g_physicalFd;
 static void setAbsRange(struct uinput_user_dev *uidev,
                         int axis, int defMin, int defMax)
 {
-    /* We'll only do fallback if not discovered. We'll scan for scancodes that map to 'axis'. */
+    /* We'll only do fallback if aggregator never discovered that axis. */
     for(int sc=0; sc<=ABS_MAX; sc++){
         if(g_discoveredAxes[sc]){
-            int finalAxis= g_absMap[sc];
-            if(finalAxis==axis){
-                // This axis is discovered => skip fallback
+            if(g_absMap[sc]==axis){
                 return;
             }
         }
     }
-    // If we get here => axis not discovered => fallback
     uidev->absmin[axis]= defMin;
     uidev->absmax[axis]= defMax;
     LOG_FF("setAbsRange: fallback axis=%d => min=%d, max=%d\n", axis, defMin, defMax);
 }
 
 /*
- * enableDiscoveredKeys => scancode => final = g_keyMap[scancode],
- * then UI_SET_KEYBIT(final).
+ * enableDiscoveredKeys => scancode => final => UI_SET_KEYBIT(final)
  */
 static void enableDiscoveredKeys(int fd)
 {
@@ -63,8 +68,7 @@ static void enableDiscoveredKeys(int fd)
 }
 
 /*
- * enableDiscoveredAxes => scancode => final= g_absMap[scancode],
- * then UI_SET_ABSBIT(final).
+ * enableDiscoveredAxes => scancode => final => UI_SET_ABSBIT(final)
  */
 static void enableDiscoveredAxes(int fd)
 {
@@ -74,7 +78,7 @@ static void enableDiscoveredAxes(int fd)
             int finalAxis= g_absMap[sc];
             if(ioctl(fd, UI_SET_ABSBIT, finalAxis)<0){
                 LOG_FF("enableDiscoveredAxes: UI_SET_ABSBIT(%d) => %s\n",
-                       finalAxis,strerror(errno));
+                       finalAxis, strerror(errno));
             } else {
                 LOG_FF("enableDiscoveredAxes: scancode=%d => finalAxis=%d\n",
                        sc, finalAxis);
@@ -89,12 +93,13 @@ static void enableDiscoveredAxes(int fd)
 }
 
 /*
- * create_virtual_controller => now merges all discovered scancodes from possibly
- * multiple devices. The user wants a single virtual pad.
+ * create_virtual_controller => merges discovered scancodes from aggregator
+ * to define a single virtual pad. Also sets up default or fallback ranges
+ * for undiscovered axes, and sets force-feedback bits.
  */
 int create_virtual_controller(int* fd_out)
 {
-    if(!fd_out)return -1;
+    if(!fd_out) return -1;
 
     int fd= open("/dev/uinput", O_RDWR|O_NONBLOCK);
     if(fd<0){
@@ -104,6 +109,9 @@ int create_virtual_controller(int* fd_out)
 
     ioctl(fd, UI_SET_EVBIT, EV_KEY);
     ioctl(fd, UI_SET_EVBIT, EV_ABS);
+
+    /* We'll also do force feedback. If real device is present, we forward
+       events to it, else fallback to timed_output. */
     ioctl(fd, UI_SET_EVBIT, EV_FF);
 
     ioctl(fd, UI_SET_FFBIT, FF_RUMBLE);
@@ -129,17 +137,15 @@ int create_virtual_controller(int* fd_out)
     uidev.id.version=0x0003;
     uidev.ff_effects_max= 32;
 
-    /*
-     * fallback setAbsRange for typical axes => only if not discovered
-     */
-    setAbsRange(&uidev, ABS_X,   -1800,  1800);
-    setAbsRange(&uidev, ABS_Y,   -1800,  1800);
-    setAbsRange(&uidev, ABS_Z,   -1800,  1800);
-    setAbsRange(&uidev, ABS_RZ,  -1800,  1800);
-    setAbsRange(&uidev, ABS_GAS,    0,   255);
-    setAbsRange(&uidev, ABS_BRAKE,  0,   255);
-    setAbsRange(&uidev, ABS_HAT0X, -1,   1);
-    setAbsRange(&uidev, ABS_HAT0Y, -1,   1);
+    /* fallback setAbsRange => typical axes => only if not discovered */
+    setAbsRange(&uidev, ABS_X,  -1800, 1800);
+    setAbsRange(&uidev, ABS_Y,  -1800, 1800);
+    setAbsRange(&uidev, ABS_Z,  -1800, 1800);
+    setAbsRange(&uidev, ABS_RZ, -1800, 1800);
+    setAbsRange(&uidev, ABS_GAS,    0, 255);
+    setAbsRange(&uidev, ABS_BRAKE,  0, 255);
+    setAbsRange(&uidev, ABS_HAT0X, -1, 1);
+    setAbsRange(&uidev, ABS_HAT0Y, -1, 1);
 
     /*
      * Now override discovered scancodes => finalAxis with real min/max
@@ -149,15 +155,15 @@ int create_virtual_controller(int* fd_out)
             int finalAxis= g_absMap[sc];
             int minVal= getPhysicalAbsMin(sc);
             int maxVal= getPhysicalAbsMax(sc);
-            LOG_FF("create_virtual_controller: scancode=%d => finalAxis=%d => min=%d, max=%d\n",
-                sc, finalAxis, minVal, maxVal);
+            LOG_FF("create_virtual_controller: sc=%d => finalAxis=%d => min=%d, max=%d\n",
+                   sc, finalAxis, minVal, maxVal);
             uidev.absmin[finalAxis]= minVal;
             uidev.absmax[finalAxis]= maxVal;
         }
     }
 
-    if(write(fd, &uidev,sizeof(uidev))<0){
-        LOG_FF("create_virtual_controller: write => %s\n",strerror(errno));
+    if(write(fd, &uidev, sizeof(uidev))<0){
+        LOG_FF("create_virtual_controller: write => %s\n", strerror(errno));
         close(fd);
         return -1;
     }
