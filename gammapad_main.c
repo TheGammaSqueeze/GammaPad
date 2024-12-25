@@ -6,10 +6,11 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <errno.h>
+#include <dirent.h>  // [ADDED: for scanning /dev/input]
+#include <sys/stat.h>
+#include <stdbool.h>
+#include <stdio.h>
 
-/*
- * We'll store up to 64 active events for auto-reset.
- */
 #define MAX_ACTIVE_EVENTS 64
 #define EPOLL_MAX_EVENTS  16
 
@@ -30,31 +31,22 @@ static struct ActiveEvent activeEvents[MAX_ACTIVE_EVENTS];
 
 int controllerFd = -1;  /* Virtual gamepad */
 int mouseFd      = -1;  /* Virtual mouse   */
+int g_physicalFd = -1;  /* leftover from single-device usage */
 
-/*
- * g_physicalFd is a leftover from single-device code. We'll keep it for 
- * compatibility, but we won't rely on it for multi-dev logic. We'll do a 
- * small array for multi-dev. 
- */
-int g_physicalFd = -1;
-
-/* [ADDED for multi-dev]
-   We'll store multiple device fds in an array. The first device is primary => remove node.
-   The rest are secondary => no removal. We'll epoll them all.
-*/
 #define MAX_PHYSICAL_DEVS 16
 static int g_physFds[MAX_PHYSICAL_DEVS];
 static int g_physCount = 0;
 
 static int g_shouldExit = 0;
-
 static void sigintHandler(int sig)
 {
     (void)sig;
     g_shouldExit = 1;
 }
 
-/* Forward declarations. */
+/*
+ * function prototypes
+ */
 int create_virtual_controller(int* fd_out);
 int create_virtual_mouse(int* fd_out);
 void destroy_virtual_device(int fd);
@@ -264,27 +256,66 @@ static void add_epoll_fd(int epfd, int fd)
     fcntl(fd,F_SETFL,O_NONBLOCK);
 }
 
+/* [ADDED: name-based resolution]
+   We'll implement a small helper function to see if arg is a raw path
+   or a device name. If it's a name, we'll search /dev/input/eventN for a match 
+   by reading EVIOCGNAME. 
+*/
+static char* maybeResolveDevicePath(const char* arg)
+{
+    // if arg starts with "/dev/" or has a slash, assume it's a direct path
+    if (strstr(arg, "/dev/") != NULL) {
+        return strdup(arg);
+    }
+
+    // else we attempt to find a device in /dev/input/event*
+    // We'll search up to e.g. event0..event64
+    // if found matching name, return that path. Else return the arg anyway.
+    // If not found, we'll let open_physical_device fail.
+
+    const int MAX_EVENT_SEARCH=64;
+    for(int i=0; i<MAX_EVENT_SEARCH; i++){
+        char devPath[128];
+        snprintf(devPath,sizeof(devPath),"/dev/input/event%d", i);
+        int fd= open(devPath, O_RDONLY);
+        if(fd<0) continue;
+
+        char devName[256];
+        memset(devName,0,sizeof(devName));
+        if(ioctl(fd, EVIOCGNAME(sizeof(devName)), devName)>=0){
+            if(!strcmp(devName,arg)){
+                // found match
+                close(fd);
+                return strdup(devPath);
+            }
+        }
+        close(fd);
+    }
+
+    // not found => fallback, let it fail as path if user typed random "retrogame_joypad"
+    // or maybe they'd set up a symlink. We'll pass it as-is.
+    return strdup(arg);
+}
+
+
 int main(int argc, char** argv)
 {
     signal(SIGINT, sigintHandler);
 
-    // [ADDED for multi-dev] parse multiple arguments as physical devices.
-    // We'll store them in g_physFds[].
     g_physCount= 0;
 
     if(argc>1){
-        // For each param from argv[1..], open_physical_device
-        // The first call => primary device => node removal at destructor
-        // The subsequent calls => secondary => aggregator but no node removal
-        // We'll just keep calling open_physical_device from capture code
-        // which now merges scancodes. We'll store the fd in g_physFds[].
         for(int i=1; i<argc; i++){
             if(g_physCount>=MAX_PHYSICAL_DEVS){
                 fprintf(stderr,"[GammaPad] Too many devices (max=%d), skipping '%s'\n",
                         MAX_PHYSICAL_DEVS, argv[i]);
                 continue;
             }
-            int fd = open_physical_device(argv[i]);
+            // [ADDED: name-based resolution]
+            char* resolvedPath= maybeResolveDevicePath(argv[i]);
+            int fd= open_physical_device(resolvedPath);
+            free(resolvedPath);
+
             if(fd<0){
                 fprintf(stderr,"[GammaPad] Could not open '%s'.\n", argv[i]);
             } else {
@@ -294,13 +325,9 @@ int main(int argc, char** argv)
         }
     }
 
-    /*
-     * Step 1: create the Virtual Pad + Virtual Mouse
-     * after aggregator scancodes are discovered from all devices
-     */
+    // create the Virtual Pad + Virtual Mouse
     if(create_virtual_controller(&controllerFd)<0){
         fprintf(stderr,"[GammaPad] create_virtual_controller => failed.\n");
-        // close all physical
         for(int i=0; i<g_physCount; i++){
             ioctl(g_physFds[i], EVIOCGRAB, 0);
             close(g_physFds[i]);
@@ -310,7 +337,6 @@ int main(int argc, char** argv)
     if(create_virtual_mouse(&mouseFd)<0){
         fprintf(stderr,"[GammaPad] create_virtual_mouse => failed.\n");
         destroy_virtual_device(controllerFd);
-        // close all physical
         for(int i=0; i<g_physCount; i++){
             ioctl(g_physFds[i], EVIOCGRAB, 0);
             close(g_physFds[i]);
@@ -321,13 +347,9 @@ int main(int argc, char** argv)
     fprintf(stderr,"GammaPad Virtual Controller (fd=%d)\n", controllerFd);
     fprintf(stderr,"GammaPad Virtual Mouse       (fd=%d)\n", mouseFd);
 
-    /*
-     * Step 2: set up epoll for the virtual pad, the physical devices, and stdin
-     */
     int epfd= epoll_create1(0);
     if(epfd<0){
         perror("epoll_create1");
-        // close physical
         for(int i=0; i<g_physCount; i++){
             ioctl(g_physFds[i], EVIOCGRAB, 0);
             close(g_physFds[i]);
@@ -341,7 +363,6 @@ int main(int argc, char** argv)
     for(int i=0; i<g_physCount; i++){
         add_epoll_fd(epfd, g_physFds[i]);
     }
-
     add_epoll_fd(epfd, STDIN_FILENO);
 
     fprintf(stderr,
@@ -382,7 +403,6 @@ int main(int argc, char** argv)
                     processStdinEvent();
                 }
             } else {
-                // must be one of the physical devs => forward events
                 if(events[i].events & EPOLLIN){
                     processPhysicalDeviceEvent(fd);
                 }
@@ -392,14 +412,12 @@ int main(int argc, char** argv)
 
     close(epfd);
 
-    // close physical devs
     for(int i=0; i<g_physCount; i++){
         ioctl(g_physFds[i],EVIOCGRAB,0);
         close(g_physFds[i]);
     }
     g_physCount= 0;
 
-    // destroy virtual devices
     destroy_virtual_device(mouseFd);
     destroy_virtual_device(controllerFd);
 
