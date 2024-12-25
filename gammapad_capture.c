@@ -23,6 +23,11 @@ static int  gHasDriver = 0; // Whether we identified a driver
 
 /*
  * We'll store discovered scancodes for EV_KEY and EV_ABS, plus min/max.
+ * 
+ * NOTE: These arrays previously only handled a single device, 
+ * but we want to merge multiple devices. We'll handle that logic
+ * by calling discoverKeys/Axes for each new device, while respecting
+ * the "first device wins" collisions.
  */
 int g_discoveredKeys[KEY_MAX+1];
 int g_discoveredAxes[ABS_MAX+1];
@@ -37,7 +42,7 @@ int g_absMap[ABS_MAX+1];
 
 /*
  * We'll also store the device path in g_physicalDevicePath
- * so we can remove it in the destructor.
+ * so we can remove it in the destructor if it's the primary device.
  */
 static char g_physicalDevicePath[256];
 
@@ -179,7 +184,7 @@ static void climbUpIfInInputSubdir(char* resolved)
  *   1) We parse out the driver path from device/driver or device/device/driver
  *   2) We readlink -f /sys/class/input/<evBase>/device => e.g.
  *       "/sys/devices/platform/singleadc-joypad/input/input183"
- *      Then we detect the "/input/input" suffix -> cut it => 
+ *      Then we detect the "/input/input" suffix -> cut it =>
  *       "/sys/devices/platform/singleadc-joypad"
  *      Then parse final slash => "singleadc-joypad"
  ****************************************************************************/
@@ -190,7 +195,7 @@ static int identifyDriverAndDevice(const char* eventNode,
     if (!eventNode || !outDriverPath || !outDeviceName) return -1;
 
     const char* evBase = strrchr(eventNode, '/');
-    if (!evBase) evBase = eventNode; 
+    if (!evBase) evBase = eventNode;
     else evBase++;
 
     /* Step 1: Try to get the driver path. */
@@ -289,93 +294,283 @@ static void unbindAndRebind(void)
 }
 
 /*
- * We'll handle collisions here so that scancode=2 or scancode=5 overshadow scancode=9 or 10
- * if they map to the same final axis code, etc.
+ * We'll handle collisions here so that scancodes from the first device 
+ * overshadow scancodes from any subsequent devices if they try to claim 
+ * the same scancode or final axis code. 
+ * 
+ * Because the user wants "the first device wins" approach, we add logic 
+ * to skip discovered scancodes from secondary devices if they're already 
+ * discovered by the primary device.
+ *
+ * We keep the same approach for triggers overshadowing normal axes, 
+ * but we do it for multi-device.
  */
-static void resolveAxisCollisions(void)
+
+/* [ADDED for multi-dev aggregator]
+   We'll define a function 'merge_discovered_keys_and_axes' that merges 
+   scancodes from a new device into the global arrays g_discoveredKeys / g_discoveredAxes,
+   respecting the "first device wins" collision logic.
+*/
+static void merge_discovered_keys(int newKeys[KEY_MAX+1], int newKeyMap[KEY_MAX+1])
 {
-    /*
-     * We'll track which final axes are "taken," storing which scancode
-     * claimed them + that scancode's range. Then if another scancode
-     * tries to claim the same final axis, we do a priority check:
-     *   1) if sc==2 or sc==5 => triggers overshadow non-triggers
-     *   2) else pick whichever has bigger range
-     */
-    struct {
-        int scancode;
-        int range; 
-    } finalUsed[ABS_MAX+1];
-
-    for (int i=0; i<=ABS_MAX; i++){
-        finalUsed[i].scancode = -1;
-        finalUsed[i].range    = 0;
-    }
-
-    for (int sc=0; sc<=ABS_MAX; sc++){
-        if (!g_discoveredAxes[sc]) continue;
-        int finalAxis = g_absMap[sc];
-        if (finalAxis<0 || finalAxis>ABS_MAX) continue;
-
-        int range = g_physicalAbsMax[sc] - g_physicalAbsMin[sc];
-        if (range < 0) range = -range;
-
-        if (finalUsed[finalAxis].scancode < 0) {
-            // Not used => take it
-            finalUsed[finalAxis].scancode = sc;
-            finalUsed[finalAxis].range    = range;
-        } else {
-            // collision => check priorities
-            int oldSc    = finalUsed[finalAxis].scancode;
-            int oldRange = finalUsed[finalAxis].range;
-
-            // We'll consider sc=2 or sc=5 "real triggers" with 0..16384
-            int isNewTrigger = ((sc == 2) || (sc == 5));
-            int isOldTrigger = ((oldSc == 2) || (oldSc == 5));
-
-            if (!isOldTrigger && isNewTrigger) {
-                // new sc is sc=2 or sc=5 => overshadow old sc
-                finalUsed[finalAxis].scancode = sc;
-                finalUsed[finalAxis].range    = range;
-                g_discoveredAxes[oldSc] = 0;
-                g_absMap[oldSc]         = -1;
-                fprintf(stderr,"[Capture] collision: finalAxis=%d oldSc=%d replaced by real trigger sc=%d\n",
-                    finalAxis, oldSc, sc);
-            }
-            else if (isOldTrigger && !isNewTrigger) {
-                // old sc=2 or 5 => overshadow sc
-                g_discoveredAxes[sc] = 0;
-                g_absMap[sc]         = -1;
-                fprintf(stderr,"[Capture] collision: finalAxis=%d sc=%d overshadowed by old real trigger sc=%d\n",
-                    finalAxis, sc, oldSc);
+    for (int sc=0; sc<=KEY_MAX; sc++){
+        if (newKeys[sc]) {
+            // If global array already discovered sc => skip
+            if (g_discoveredKeys[sc]) {
+                // The first device discovered it => do nothing
             } else {
-                // both triggers or both not triggers => pick bigger range
-                if (range > oldRange) {
-                    finalUsed[finalAxis].scancode = sc;
-                    finalUsed[finalAxis].range    = range;
-                    g_discoveredAxes[oldSc] = 0;
-                    g_absMap[oldSc]         = -1;
-                    fprintf(stderr,"[Capture] collision: finalAxis=%d oldSc=%d replaced by sc=%d w/ bigger range\n",
-                        finalAxis, oldSc, sc);
-                } else {
-                    // keep old => unmap sc
-                    g_discoveredAxes[sc] = 0;
-                    g_absMap[sc]         = -1;
-                    fprintf(stderr,"[Capture] collision: finalAxis=%d sc=%d overshadowed by old sc=%d w/ bigger range\n",
-                        finalAxis, sc, oldSc);
-                }
+                // Not discovered yet => adopt
+                g_discoveredKeys[sc] = 1;
+                g_keyMap[sc]         = newKeyMap[sc];
+            }
+        }
+    }
+}
+
+static void merge_discovered_axes(int newAxes[ABS_MAX+1], int newAbsMap[ABS_MAX+1],
+                                  int newAbsMin[ABS_MAX+1], int newAbsMax[ABS_MAX+1])
+{
+    for (int sc=0; sc<=ABS_MAX; sc++){
+        if (newAxes[sc]) {
+            if (g_discoveredAxes[sc]) {
+                // Already discovered => skip
+            } else {
+                // Not discovered => adopt
+                g_discoveredAxes[sc]   = 1;
+                g_absMap[sc]           = newAbsMap[sc];
+                g_physicalAbsMin[sc]   = newAbsMin[sc];
+                g_physicalAbsMax[sc]   = newAbsMax[sc];
             }
         }
     }
 }
 
 /*
- * open_physical_device:
+ * We'll do the original single-device approach inside discoverKeys/discoverAxes,
+ * but for each new device, we'll store them in local arrays, then call 
+ * merge_discovered_keys/axes to unify them globally. 
+ */
+
+/*
+ * We'll keep the original single-device discover logic, but rename them 
+ * to discoverSingleDeviceKeys/Axes, then a wrapper discoverKeys/Axes 
+ * that merges them.
+ */
+static void discoverSingleDeviceKeys(int fd, int outKeys[KEY_MAX+1], int outKeyMap[KEY_MAX+1])
+{
+    unsigned long keyBits[(KEY_MAX+1)/(8*sizeof(long))];
+    memset(keyBits, 0, sizeof(keyBits));
+    memset(outKeys, 0, sizeof(int)*(KEY_MAX+1));
+
+    for (int i=0; i<=KEY_MAX; i++){
+        outKeyMap[i] = i; // fallback
+    }
+
+    if (ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(keyBits)), keyBits) < 0) {
+        fprintf(stderr, "[GammaPadCapture] discoverSingleDeviceKeys: EVIOCGBIT(EV_KEY) => %s\n",
+                strerror(errno));
+        return;
+    }
+    int countFound=0;
+    for (int code=0; code<=KEY_MAX; code++){
+        int bitSet = (keyBits[code/(8*sizeof(long))] >> (code%(8*sizeof(long)))) & 1;
+        if (bitSet) {
+            outKeys[code] = 1;
+            countFound++;
+        }
+    }
+    fprintf(stderr,"[GammaPadCapture] discoverSingleDeviceKeys => found %d key scancodes.\n", countFound);
+}
+
+/* same for axes */
+static void discoverSingleDeviceAxes(int fd, int outAxes[ABS_MAX+1], int outAbsMap[ABS_MAX+1],
+                                     int outAbsMin[ABS_MAX+1], int outAbsMax[ABS_MAX+1])
+{
+    unsigned long absBits[(ABS_MAX+1)/(8*sizeof(long))];
+    memset(absBits, 0, sizeof(absBits));
+    memset(outAxes, 0, sizeof(int)*(ABS_MAX+1));
+
+    for (int i=0; i<=ABS_MAX; i++){
+        outAbsMap[i] = i; // fallback
+        outAbsMin[i] = -32768;
+        outAbsMax[i] = 32767;
+    }
+
+    if (ioctl(fd, EVIOCGBIT(EV_ABS, sizeof(absBits)), absBits) < 0) {
+        fprintf(stderr, "[GammaPadCapture] discoverSingleDeviceAxes: EVIOCGBIT(EV_ABS) => %s\n",
+                strerror(errno));
+        return;
+    }
+    int countFound=0;
+    for (int code=0; code<=ABS_MAX; code++){
+        int bitSet = (absBits[code/(8*sizeof(long))] >> (code % (8*sizeof(long)))) & 1;
+        if (!bitSet) {
+            continue;
+        }
+        outAxes[code] = 1;
+        countFound++;
+        struct input_absinfo info;
+        if (ioctl(fd, EVIOCGABS(code), &info) == 0) {
+            outAbsMin[code] = info.minimum;
+            outAbsMax[code] = info.maximum;
+            fprintf(stderr,"[GammaPadCapture] discoverSingleDeviceAxes: scancode=%d => min=%d, max=%d\n",
+                code, info.minimum, info.maximum);
+        } else {
+            fprintf(stderr,"[GammaPadCapture] discoverSingleDeviceAxes: EVIOCGABS(%d) => fail %s\n",
+                code, strerror(errno));
+        }
+    }
+    fprintf(stderr,"[GammaPadCapture] discoverSingleDeviceAxes => found %d axis scancodes.\n", countFound);
+}
+
+/*
+ * We'll keep parse_android_keylayout_file_if_needed and parseKeyLayoutLine 
+ * the same, but rename discoverKeys, discoverAxes to reflect 
+ * the aggregator approach.
+ */
+
+/* We keep the same #ifdef logic, no changes. */
+#ifdef __ANDROID__
+void parse_android_keylayout_file_if_needed(int fd)
+{
+    fprintf(stderr, "[GammaPadCapture] parse_android_keylayout_file_if_needed: Attempting .kl parse...\n");
+    struct input_id id;
+    if (ioctl(fd, EVIOCGID, &id) == 0) {
+        fprintf(stderr,"[GammaPadCapture] Vendor=0x%04x Product=0x%04x\n",
+                id.vendor, id.product);
+
+        char klPath[256];
+        snprintf(klPath, sizeof(klPath),
+            "/system/usr/keylayout/Vendor_%04x_Product_%04x.kl",
+            id.vendor, id.product);
+
+        FILE* f = fopen(klPath, "r");
+        if (!f) {
+            fprintf(stderr,"[KL] No .kl found at %s\n", klPath);
+            return;
+        }
+        fprintf(stderr,"[KL] Found .kl => %s, parsing...\n", klPath);
+
+        char line[256];
+        while (fgets(line, sizeof(line), f)) {
+            char* nl = strchr(line,'\n');
+            if (nl) *nl=0;
+            parseKeyLayoutLine(line);
+        }
+        fclose(f);
+    }
+}
+#else
+void parse_android_keylayout_file_if_needed(int fd)
+{
+    (void)fd;
+}
+#endif
+
+/*
+ * parseKeyLayoutLine => unchanged
+ */
+void parseKeyLayoutLine(const char* line)
+{
+    char type[32], sCode[32], name[32], rest[128];
+    memset(type,0,sizeof(type));
+    memset(sCode,0,sizeof(sCode));
+    memset(name,0,sizeof(name));
+    memset(rest,0,sizeof(rest));
+
+    int parts = sscanf(line, "%31s %31s %31s %127[^\n]", type, sCode, name, rest);
+    if (parts < 3) {
+        return;
+    }
+    if (!strcasecmp(type, "key")) {
+        int scancode = 0;
+        if (!strncasecmp(sCode,"0x",2)) {
+            scancode = (int)strtol(sCode,NULL,16);
+        } else {
+            scancode = atoi(sCode);
+        }
+        if (scancode>=0 && scancode<=KEY_MAX) {
+            if (!strcasecmp(name,"BUTTON_A"))      g_keyMap[scancode]= BTN_A;
+            else if (!strcasecmp(name,"BUTTON_B")) g_keyMap[scancode]= BTN_B;
+            else if (!strcasecmp(name,"BUTTON_X")) g_keyMap[scancode]= BTN_X;
+            else if (!strcasecmp(name,"BUTTON_Y")) g_keyMap[scancode]= BTN_Y;
+            /* fallback => scancode=>scancode if not recognized */
+
+            fprintf(stderr,"[KL] 'key %s %s' => scancode=%d => final=%d\n",
+                sCode,name,scancode,g_keyMap[scancode]);
+        }
+    }
+    else if (!strcasecmp(type, "axis")) {
+        int scancode=0;
+        if (!strncasecmp(sCode,"0x",2)) {
+            scancode= (int)strtol(sCode,NULL,16);
+        } else {
+            scancode= atoi(sCode);
+        }
+        if (scancode>=0 && scancode<=ABS_MAX) {
+            if (!strcasecmp(name,"X"))         g_absMap[scancode] = ABS_X;
+            else if (!strcasecmp(name,"Y"))    g_absMap[scancode] = ABS_Y;
+            else if (!strcasecmp(name,"Z"))    g_absMap[scancode] = ABS_Z;
+            else if (!strcasecmp(name,"RZ"))   g_absMap[scancode] = ABS_RZ;
+            else if (!strcasecmp(name,"LTRIGGER")) g_absMap[scancode] = ABS_BRAKE;  // no swap
+            else if (!strcasecmp(name,"RTRIGGER")) g_absMap[scancode] = ABS_GAS;    // no swap
+            else if (!strcasecmp(name,"HAT_X"))     g_absMap[scancode] = ABS_HAT0X;
+            else if (!strcasecmp(name,"HAT_Y"))     g_absMap[scancode] = ABS_HAT0Y;
+            /* fallback => scancode => scancode */
+
+            fprintf(stderr,"[KL] 'axis %s %s' => scancode=%d => finalAbs=%d\n",
+                sCode,name,scancode,g_absMap[scancode]);
+        }
+    }
+}
+
+/*
+ * discoverKeys => aggregator that calls discoverSingleDeviceKeys, merges in.
+ */
+void discoverKeys(int fd)
+{
+    int singleKeys[KEY_MAX+1];
+    int singleKeyMap[KEY_MAX+1];
+    discoverSingleDeviceKeys(fd, singleKeys, singleKeyMap);
+
+    // Merge them
+    merge_discovered_keys(singleKeys, singleKeyMap);
+}
+
+/*
+ * discoverAxes => aggregator that calls discoverSingleDeviceAxes, merges in.
+ */
+void discoverAxes(int fd)
+{
+    int singleAxes[ABS_MAX+1];
+    int singleAbsMap[ABS_MAX+1];
+    int singleAbsMin[ABS_MAX+1];
+    int singleAbsMax[ABS_MAX+1];
+
+    discoverSingleDeviceAxes(fd, singleAxes, singleAbsMap, singleAbsMin, singleAbsMax);
+
+    // Merge them
+    merge_discovered_axes(singleAxes, singleAbsMap, singleAbsMin, singleAbsMax);
+}
+
+/*
+ * open_physical_device => 
  *   1) parse the driver path & device name from sysfs
  *   2) open + grab the device
- *   3) parse .kl + discover keys+axes
- *   4) call resolveAxisCollisions() => ensure triggers not overshadowed
- *   5) store the path => destructor can remove it at exit
+ *   3) parse .kl + discover scancodes (merging them if we already had from another device)
+ *   4) store the path => so destructor can remove it at exit (only if first device)
+ *
+ * For multi-device logic, we add a param "isPrimary" to decide if we remove node or not,
+ * but to keep the user’s original function signature, we store an internal static array 
+ * or use an approach from gammapad_main. 
+ *
+ * For minimal intrusion, we keep the function signature but assume the FIRST TIME 
+ * we call it is primary; subsequent times are secondary.
  */
+
+// [ADDED for multi-dev]
+static int g_hasPrimaryDevice = 0;
+
 int open_physical_device(const char* device_path)
 {
     if (!device_path) return -1;
@@ -387,47 +582,49 @@ int open_physical_device(const char* device_path)
         return -1;
     }
 
-    if (identifyDriverAndDevice(
-            device_path,
-            g_driverPath, sizeof(g_driverPath),
-            g_deviceName, sizeof(g_deviceName))==0)
-    {
-        gHasDriver = 1;
-    } else {
-        fprintf(stderr,
-            "[GammaPadCapture] Could not identify driver/device from sysfs for '%s', skipping unbind.\n",
-            device_path);
-        gHasDriver = 0;
+    // Check if we have a primary device yet
+    int isPrimary = 0;
+    if (!g_hasPrimaryDevice) {
+        // Mark this one as primary
+        isPrimary = 1;
+        g_hasPrimaryDevice = 1;
     }
 
-    memset(g_physicalDevicePath,0,sizeof(g_physicalDevicePath));
-    strncpy(g_physicalDevicePath, device_path, sizeof(g_physicalDevicePath)-1);
+    // If it's primary => parse out driver path
+    if (isPrimary) {
+        if (identifyDriverAndDevice(
+                device_path,
+                g_driverPath, sizeof(g_driverPath),
+                g_deviceName, sizeof(g_deviceName))==0)
+        {
+            gHasDriver = 1;
+        } else {
+            fprintf(stderr,
+                "[GammaPadCapture] Could not identify driver/device from sysfs for '%s', skipping unbind.\n",
+                device_path);
+            gHasDriver = 0;
+        }
 
-    for (int i=0; i<=KEY_MAX; i++){
-        g_keyMap[i] = i;
-        g_discoveredKeys[i] = 0;
-    }
-    for (int i=0; i<=ABS_MAX; i++){
-        g_absMap[i] = i;
-        g_discoveredAxes[i] = 0;
-        g_physicalAbsMin[i] = 0;
-        g_physicalAbsMax[i] = 0;
+        memset(g_physicalDevicePath,0,sizeof(g_physicalDevicePath));
+        strncpy(g_physicalDevicePath, device_path, sizeof(g_physicalDevicePath)-1);
     }
 
 #ifdef __ANDROID__
     parse_android_keylayout_file_if_needed(fd);
 #endif
 
+    // aggregator discover
     discoverKeys(fd);
     discoverAxes(fd);
-    resolveAxisCollisions();
+    // collision resolution is done in gammapad_controller.c => not needed here.
 
     if (ioctl(fd, EVIOCGRAB, 1) < 0) {
         fprintf(stderr, "[GammaPadCapture] EVIOCGRAB on %s failed: %s\n",
                 device_path, strerror(errno));
     }
 
-    fprintf(stderr,"[GammaPadCapture] open_physical_device => '%s' opened.\n", device_path);
+    fprintf(stderr,"[GammaPadCapture] open_physical_device => '%s' (fd=%d). isPrimary=%d\n",
+        device_path, fd, isPrimary);
     return fd;
 }
 
@@ -487,171 +684,20 @@ void forward_physical_event(const struct input_event* ev)
 }
 
 /*
- * destructor => remove node + unbind/rebind at program exit
+ * destructor => remove node + unbind/rebind at program exit if isPrimary device
  */
 __attribute__((destructor))
 static void onFinish(void)
 {
-    fprintf(stderr, "[GammaPadCapture] onFinish() => removing node + unbind/rebind.\n");
+    fprintf(stderr, "[GammaPadCapture] onFinish() => removing node + unbind/rebind for primary device.\n");
 
+    // If we had a primary device
     if (g_physicalDevicePath[0]) {
         char rmCmd[300];
         snprintf(rmCmd, sizeof(rmCmd), "rm -f '%s'", g_physicalDevicePath);
         fprintf(stderr, "[GammaPadCapture] destructor => remove node => %s\n", rmCmd);
         system(rmCmd);
     }
+
     unbindAndRebind();
-}
-
-#ifdef __ANDROID__
-void parse_android_keylayout_file_if_needed(int fd)
-{
-    fprintf(stderr, "[GammaPadCapture] parse_android_keylayout_file_if_needed: Attempting .kl parse...\n");
-    struct input_id id;
-    if (ioctl(fd, EVIOCGID, &id) == 0) {
-        fprintf(stderr,"[GammaPadCapture] Vendor=0x%04x Product=0x%04x\n",
-                id.vendor, id.product);
-
-        char klPath[256];
-        snprintf(klPath, sizeof(klPath),
-            "/system/usr/keylayout/Vendor_%04x_Product_%04x.kl",
-            id.vendor, id.product);
-
-        FILE* f = fopen(klPath, "r");
-        if (!f) {
-            fprintf(stderr,"[KL] No .kl found at %s\n", klPath);
-            return;
-        }
-        fprintf(stderr,"[KL] Found .kl => %s, parsing...\n", klPath);
-
-        char line[256];
-        while (fgets(line, sizeof(line), f)) {
-            char* nl = strchr(line,'\n');
-            if (nl) *nl=0;
-            parseKeyLayoutLine(line);
-        }
-        fclose(f);
-    }
-}
-#else
-void parse_android_keylayout_file_if_needed(int fd)
-{
-    (void)fd;
-}
-#endif
-
-/*
- * parseKeyLayoutLine => "no swapping" means:
- * LTRIGGER => ABS_BRAKE, RTRIGGER => ABS_GAS
- */
-void parseKeyLayoutLine(const char* line)
-{
-    char type[32], sCode[32], name[32], rest[128];
-    memset(type,0,sizeof(type));
-    memset(sCode,0,sizeof(sCode));
-    memset(name,0,sizeof(name));
-    memset(rest,0,sizeof(rest));
-
-    int parts = sscanf(line, "%31s %31s %31s %127[^\n]", type, sCode, name, rest);
-    if (parts < 3) {
-        return;
-    }
-    if (!strcasecmp(type, "key")) {
-        int scancode = 0;
-        if (!strncasecmp(sCode,"0x",2)) {
-            scancode = (int)strtol(sCode,NULL,16);
-        } else {
-            scancode = atoi(sCode);
-        }
-        if (scancode>=0 && scancode<=KEY_MAX) {
-            if (!strcasecmp(name,"BUTTON_A"))      g_keyMap[scancode]= BTN_A;
-            else if (!strcasecmp(name,"BUTTON_B")) g_keyMap[scancode]= BTN_B;
-            else if (!strcasecmp(name,"BUTTON_X")) g_keyMap[scancode]= BTN_X;
-            else if (!strcasecmp(name,"BUTTON_Y")) g_keyMap[scancode]= BTN_Y;
-            /* fallback => scancode=>scancode if not recognized */
-
-            fprintf(stderr,"[KL] 'key %s %s' => scancode=%d => final=%d\n",
-                sCode,name,scancode,g_keyMap[scancode]);
-        }
-    }
-    else if (!strcasecmp(type, "axis")) {
-        int scancode=0;
-        if (!strncasecmp(sCode,"0x",2)) {
-            scancode= (int)strtol(sCode,NULL,16);
-        } else {
-            scancode= atoi(sCode);
-        }
-        if (scancode>=0 && scancode<=ABS_MAX) {
-            if (!strcasecmp(name,"X"))         g_absMap[scancode] = ABS_X;
-            else if (!strcasecmp(name,"Y"))    g_absMap[scancode] = ABS_Y;
-            else if (!strcasecmp(name,"Z"))    g_absMap[scancode] = ABS_Z;
-            else if (!strcasecmp(name,"RZ"))   g_absMap[scancode] = ABS_RZ;
-            else if (!strcasecmp(name,"LTRIGGER")) g_absMap[scancode] = ABS_BRAKE;  // no swap
-            else if (!strcasecmp(name,"RTRIGGER")) g_absMap[scancode] = ABS_GAS;    // no swap
-            else if (!strcasecmp(name,"HAT_X"))     g_absMap[scancode] = ABS_HAT0X;
-            else if (!strcasecmp(name,"HAT_Y"))     g_absMap[scancode] = ABS_HAT0Y;
-            /* fallback => scancode => scancode */
-
-            fprintf(stderr,"[KL] 'axis %s %s' => scancode=%d => finalAbs=%d\n",
-                sCode,name,scancode,g_absMap[scancode]);
-        }
-    }
-}
-
-void discoverKeys(int fd)
-{
-    unsigned long keyBits[(KEY_MAX+1)/(8*sizeof(long))];
-    memset(keyBits, 0, sizeof(keyBits));
-
-    if (ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(keyBits)), keyBits) < 0) {
-        fprintf(stderr, "[GammaPadCapture] discoverKeys: EVIOCGBIT(EV_KEY) => %s\n",
-                strerror(errno));
-        return;
-    }
-    int countFound=0;
-    for (int code=0; code<=KEY_MAX; code++){
-        int bitSet = (keyBits[code/(8*sizeof(long))] >> (code%(8*sizeof(long)))) & 1;
-        if (bitSet) {
-            g_discoveredKeys[code] = 1;
-            countFound++;
-        }
-    }
-    fprintf(stderr,"[GammaPadCapture] discoverKeys => found %d key scancodes.\n", countFound);
-}
-
-void discoverAxes(int fd)
-{
-    unsigned long absBits[(ABS_MAX+1)/(8*sizeof(long))];
-    memset(absBits, 0, sizeof(absBits));
-
-    if (ioctl(fd, EVIOCGBIT(EV_ABS, sizeof(absBits)), absBits) < 0) {
-        fprintf(stderr, "[GammaPadCapture] discoverAxes: EVIOCGBIT(EV_ABS) => %s\n",
-                strerror(errno));
-        return;
-    }
-    int countFound=0;
-    for (int code=0; code<=ABS_MAX; code++){
-        int bitSet = (absBits[code/(8*sizeof(long))] >> (code % (8*sizeof(long)))) & 1;
-        if (!bitSet) {
-            g_discoveredAxes[code] = 0;
-            g_physicalAbsMin[code] = 0;
-            g_physicalAbsMax[code] = 0;
-            continue;
-        }
-        g_discoveredAxes[code] = 1;
-        countFound++;
-        struct input_absinfo info;
-        if (ioctl(fd, EVIOCGABS(code), &info) == 0) {
-            g_physicalAbsMin[code] = info.minimum;
-            g_physicalAbsMax[code] = info.maximum;
-            fprintf(stderr,"[GammaPadCapture] discoverAxes: scancode=%d => min=%d, max=%d\n",
-                code, info.minimum, info.maximum);
-        } else {
-            g_physicalAbsMin[code] = -32768;
-            g_physicalAbsMax[code] = 32767;
-            fprintf(stderr,"[GammaPadCapture] discoverAxes: EVIOCGABS(%d) => fail %s\n",
-                code, strerror(errno));
-        }
-    }
-    fprintf(stderr,"[GammaPadCapture] discoverAxes => found %d axis scancodes.\n", countFound);
 }

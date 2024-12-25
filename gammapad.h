@@ -16,7 +16,7 @@
 #include <sys/time.h>
 #include <pthread.h>
 
-/* 
+/*
  * If you want more logs, compile with -DGAMMAPAD_VERBOSE_LOGGING=1
  */
 #ifndef GAMMAPAD_VERBOSE_LOGGING
@@ -56,6 +56,8 @@ extern int controllerFd;
 
 /*
  * Also expose g_physicalFd so we can read absmin/absmax from the captured device.
+ * In multi-dev scenario, we still keep it for legacy usage, 
+ * but we store multiple device fds in gammapad_main.
  */
 extern int g_physicalFd;
 

@@ -30,7 +30,21 @@ static struct ActiveEvent activeEvents[MAX_ACTIVE_EVENTS];
 
 int controllerFd = -1;  /* Virtual gamepad */
 int mouseFd      = -1;  /* Virtual mouse   */
-int g_physicalFd = -1;  /* Source device   */
+
+/*
+ * g_physicalFd is a leftover from single-device code. We'll keep it for 
+ * compatibility, but we won't rely on it for multi-dev logic. We'll do a 
+ * small array for multi-dev. 
+ */
+int g_physicalFd = -1;
+
+/* [ADDED for multi-dev]
+   We'll store multiple device fds in an array. The first device is primary => remove node.
+   The rest are secondary => no removal. We'll epoll them all.
+*/
+#define MAX_PHYSICAL_DEVS 16
+static int g_physFds[MAX_PHYSICAL_DEVS];
+static int g_physCount = 0;
 
 static int g_shouldExit = 0;
 
@@ -254,66 +268,80 @@ int main(int argc, char** argv)
 {
     signal(SIGINT, sigintHandler);
 
-    /*
-     * Step 1: If user specified a physical device path, open it first,
-     * parse .kl, discover scancodes, but DO NOT remove the node yet.
-     */
+    // [ADDED for multi-dev] parse multiple arguments as physical devices.
+    // We'll store them in g_physFds[].
+    g_physCount= 0;
+
     if(argc>1){
-        g_physicalFd= open_physical_device(argv[1]);
-        if(g_physicalFd<0){
-            fprintf(stderr,"[GammaPad] Could not open '%s'. Will proceed with no physical.\n", argv[1]);
-            g_physicalFd=-1;
-        } else {
-            fprintf(stderr,"[GammaPad] Source '%s' opened.\n", argv[1]);
-            /* We do NOT remove node here. We'll do it after creating the virtual pad. */
+        // For each param from argv[1..], open_physical_device
+        // The first call => primary device => node removal at destructor
+        // The subsequent calls => secondary => aggregator but no node removal
+        // We'll just keep calling open_physical_device from capture code
+        // which now merges scancodes. We'll store the fd in g_physFds[].
+        for(int i=1; i<argc; i++){
+            if(g_physCount>=MAX_PHYSICAL_DEVS){
+                fprintf(stderr,"[GammaPad] Too many devices (max=%d), skipping '%s'\n",
+                        MAX_PHYSICAL_DEVS, argv[i]);
+                continue;
+            }
+            int fd = open_physical_device(argv[i]);
+            if(fd<0){
+                fprintf(stderr,"[GammaPad] Could not open '%s'.\n", argv[i]);
+            } else {
+                g_physFds[g_physCount] = fd;
+                g_physCount++;
+            }
         }
     }
 
     /*
-     * Step 2: create the Virtual Pad + Virtual Mouse
+     * Step 1: create the Virtual Pad + Virtual Mouse
+     * after aggregator scancodes are discovered from all devices
      */
     if(create_virtual_controller(&controllerFd)<0){
         fprintf(stderr,"[GammaPad] create_virtual_controller => failed.\n");
+        // close all physical
+        for(int i=0; i<g_physCount; i++){
+            ioctl(g_physFds[i], EVIOCGRAB, 0);
+            close(g_physFds[i]);
+        }
         return 1;
     }
     if(create_virtual_mouse(&mouseFd)<0){
         fprintf(stderr,"[GammaPad] create_virtual_mouse => failed.\n");
         destroy_virtual_device(controllerFd);
+        // close all physical
+        for(int i=0; i<g_physCount; i++){
+            ioctl(g_physFds[i], EVIOCGRAB, 0);
+            close(g_physFds[i]);
+        }
         return 1;
     }
+
     fprintf(stderr,"GammaPad Virtual Controller (fd=%d)\n", controllerFd);
     fprintf(stderr,"GammaPad Virtual Mouse       (fd=%d)\n", mouseFd);
 
     /*
-     * Step 3: remove the node from /dev/input if we have a real device.
-     */
-    if(g_physicalFd>=0 && argc>1){
-        char rmCmd[300];
-        snprintf(rmCmd,sizeof(rmCmd), "rm -f '%s'", argv[1]);
-        fprintf(stderr,"[GammaPad] Removing node with: %s\n", rmCmd);
-        system(rmCmd);
-        fprintf(stderr,"[GammaPad] Removed node: %s\n", argv[1]);
-        fprintf(stderr,"[GammaPad] Capturing input from '%s'.\n", argv[1]);
-    }
-
-    /*
-     * Step 4: set up epoll for the virtual pad, the physical device, and stdin
+     * Step 2: set up epoll for the virtual pad, the physical devices, and stdin
      */
     int epfd= epoll_create1(0);
     if(epfd<0){
         perror("epoll_create1");
-        if(g_physicalFd>=0){
-            ioctl(g_physicalFd, EVIOCGRAB, 0);
-            close(g_physicalFd);
+        // close physical
+        for(int i=0; i<g_physCount; i++){
+            ioctl(g_physFds[i], EVIOCGRAB, 0);
+            close(g_physFds[i]);
         }
         destroy_virtual_device(mouseFd);
         destroy_virtual_device(controllerFd);
         return 1;
     }
     add_epoll_fd(epfd, controllerFd);
-    if(g_physicalFd>=0){
-        add_epoll_fd(epfd, g_physicalFd);
+
+    for(int i=0; i<g_physCount; i++){
+        add_epoll_fd(epfd, g_physFds[i]);
     }
+
     add_epoll_fd(epfd, STDIN_FILENO);
 
     fprintf(stderr,
@@ -353,9 +381,10 @@ int main(int argc, char** argv)
                 if(events[i].events & EPOLLIN){
                     processStdinEvent();
                 }
-            } else if(fd==g_physicalFd){
+            } else {
+                // must be one of the physical devs => forward events
                 if(events[i].events & EPOLLIN){
-                    processPhysicalDeviceEvent(g_physicalFd);
+                    processPhysicalDeviceEvent(fd);
                 }
             }
         }
@@ -363,12 +392,14 @@ int main(int argc, char** argv)
 
     close(epfd);
 
-    if(g_physicalFd>=0){
-        ioctl(g_physicalFd,EVIOCGRAB,0);
-        close(g_physicalFd);
-        g_physicalFd=-1;
+    // close physical devs
+    for(int i=0; i<g_physCount; i++){
+        ioctl(g_physFds[i],EVIOCGRAB,0);
+        close(g_physFds[i]);
     }
+    g_physCount= 0;
 
+    // destroy virtual devices
     destroy_virtual_device(mouseFd);
     destroy_virtual_device(controllerFd);
 

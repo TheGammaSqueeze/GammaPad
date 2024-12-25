@@ -88,6 +88,10 @@ static void enableDiscoveredAxes(int fd)
     }
 }
 
+/*
+ * create_virtual_controller => now merges all discovered scancodes from possibly
+ * multiple devices. The user wants a single virtual pad.
+ */
 int create_virtual_controller(int* fd_out)
 {
     if(!fd_out)return -1;
@@ -128,14 +132,14 @@ int create_virtual_controller(int* fd_out)
     /*
      * fallback setAbsRange for typical axes => only if not discovered
      */
-    setAbsRange(&uidev, ABS_X,   -1800, 1800);
-    setAbsRange(&uidev, ABS_Y,   -1800, 1800);
-    setAbsRange(&uidev, ABS_Z,   -1800, 1800);
-    setAbsRange(&uidev, ABS_RZ,  -1800, 1800);
-    setAbsRange(&uidev, ABS_GAS,   0,   255);
-    setAbsRange(&uidev, ABS_BRAKE, 0,   255);
-    setAbsRange(&uidev, ABS_HAT0X, -1,  1);
-    setAbsRange(&uidev, ABS_HAT0Y, -1,  1);
+    setAbsRange(&uidev, ABS_X,   -1800,  1800);
+    setAbsRange(&uidev, ABS_Y,   -1800,  1800);
+    setAbsRange(&uidev, ABS_Z,   -1800,  1800);
+    setAbsRange(&uidev, ABS_RZ,  -1800,  1800);
+    setAbsRange(&uidev, ABS_GAS,    0,   255);
+    setAbsRange(&uidev, ABS_BRAKE,  0,   255);
+    setAbsRange(&uidev, ABS_HAT0X, -1,   1);
+    setAbsRange(&uidev, ABS_HAT0Y, -1,   1);
 
     /*
      * Now override discovered scancodes => finalAxis with real min/max
