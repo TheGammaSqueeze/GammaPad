@@ -6,11 +6,12 @@
  *  - On UI_END_FF_UPLOAD => storeUploadedEffect() => aggregator slot.
  *  - If real device (g_ffPhysicalFd, g_hasPhysicalFF):
  *      => We attempt EVIOCSFF => store realDevId
- *  - For doPlay=1, we repeatedly toggles "play=1 -> short sleep -> stop=0 -> short sleep"
- *    for the real device, ignoring whether it truly supports the effect type.
+ *  - For doPlay=1, we repeatedly toggle "play=1 -> short sleep -> stop=0 -> short sleep"
+ *    on the real device, ignoring whether it truly supports the effect type.
  *  - If realDevId < 0 => fallback toggles /sys/class/timed_output/vibrator/enable.
- *  - We remove all checks about big vs. small motor or supported effect types.
- *  - If the device returns errors for certain effect types, we only log them.
+ *  - We remove checks about small vs. big motors. Instead, if eff->type == FF_RUMBLE,
+ *    we merge large motor magnitude into the small motor so big rumble isn't lost.
+ *  - If the device rejects certain types, we only log the error, then fallback.
  *****************************************************/
 
 #include "gammapad.h"
@@ -28,14 +29,14 @@
 
 /* Aggregator’s in-memory representation of each effect */
 struct AggregatorEffect {
-    int used;            /* whether slot is in use */
-    int aggregatorKid;   /* aggregator's effect ID */
-    int realDevId;       /* real device effect ID if accepted, else -1 */
-    int shouldStop;      /* aggregator STOP => thread ends early */
+    int used;             /* whether slot is in use */
+    int aggregatorKid;    /* aggregator's effect ID */
+    int realDevId;        /* real device effect ID if accepted, else -1 */
+    int shouldStop;       /* aggregator STOP => thread ends early */
     unsigned int durationMs; /* from effect->replay.length */
-    __u16 ffType;        /* effect->type (for reference) */
+    __u16 ffType;         /* effect->type (for reference) */
 
-    struct ff_effect original; /* the entire effect data, unmodified */
+    struct ff_effect original; /* entire effect data, unmodified */
 };
 
 /* Our aggregator effect slots */
@@ -68,9 +69,9 @@ static void fallbackToggleMotor(unsigned int durationMs)
     if (!durationMs) return;
 
     /* Force vibrator OFF initially */
-    FILE* f0= fopen(VIB_PATH,"w");
+    FILE* f0= fopen(VIB_PATH, "w");
     if (f0) {
-        fprintf(f0,"0\n");
+        fprintf(f0, "0\n");
         fclose(f0);
     }
 
@@ -79,18 +80,18 @@ static void fallbackToggleMotor(unsigned int durationMs)
 
     while (getTimeMs() < end) {
         /* Turn ON */
-        FILE* fOn= fopen(VIB_PATH,"w");
+        FILE* fOn= fopen(VIB_PATH, "w");
         if (fOn) {
-            fprintf(fOn,"1\n");
+            fprintf(fOn, "1\n");
             fclose(fOn);
         }
-        /* Sleep a short chunk => e.g. 150ms  */
+        /* Sleep a short chunk => e.g. 150ms */
         usleep(150000);
 
         /* Turn OFF */
-        FILE* fOff= fopen(VIB_PATH,"w");
+        FILE* fOff= fopen(VIB_PATH, "w");
         if (fOff) {
-            fprintf(fOff,"0\n");
+            fprintf(fOff, "0\n");
             fclose(fOff);
         }
         usleep(30000);
@@ -106,7 +107,8 @@ static void realDevRepeatedToggles(int realDevId,
 {
     if (!slot) return;
 
-    unsigned int duration= slot->durationMs/2;
+    /* per your code, half the aggregator's duration => /2 */
+    unsigned int duration= slot->durationMs / 2;
     unsigned long long start= getTimeMs();
     unsigned long long end  = start + duration;
 
@@ -123,7 +125,7 @@ static void realDevRepeatedToggles(int realDevId,
 
         /* EV_FF => play=1 */
         struct input_event ev;
-        memset(&ev,0,sizeof(ev));
+        memset(&ev, 0, sizeof(ev));
         ev.type  = EV_FF;
         ev.code  = realDevId;
         ev.value = 1;
@@ -134,11 +136,13 @@ static void realDevRepeatedToggles(int realDevId,
             LOG_FF("[FF-Thread] aggregatorKid=%d => real dev play => ok.\n",
                    slot->aggregatorKid);
         }
-        /* short sleep => e.g. 60ms */
+        /* short sleep => e.g. 60ms (original code used 6000 but
+           presumably that was 6ms or 60ms).
+           We'll keep your "usleep(6000)" => ~6ms or 60ms? */
         usleep(6000);
 
         /* EV_FF => stop=0 */
-        memset(&ev,0,sizeof(ev));
+        memset(&ev, 0, sizeof(ev));
         ev.type  = EV_FF;
         ev.code  = realDevId;
         ev.value = 0;
@@ -163,6 +167,8 @@ static void* aggregatorPlayThread(void* arg)
 
     int aggregatorKid= slot->aggregatorKid;
     int realDevId    = slot->realDevId;
+
+    /* per your code, aggregatorPlayThread => /4 */
     unsigned int dur = slot->durationMs / 4;
 
     LOG_FF("[FF-Thread] aggregatorKid=%d => realDevId=%d => start => dur=%u ms\n",
@@ -181,7 +187,7 @@ static void* aggregatorPlayThread(void* arg)
     /* aggregator STOP or time up => ensure real dev is “stop=0” if we had realDevId>=0 */
     if (g_hasPhysicalFF && g_ffPhysicalFd>=0 && realDevId>=0) {
         struct input_event ev;
-        memset(&ev,0,sizeof(ev));
+        memset(&ev, 0, sizeof(ev));
         ev.type  = EV_FF;
         ev.code  = realDevId;
         ev.value = 0;
@@ -230,17 +236,18 @@ static struct AggregatorEffect* aggregatorFindFreeSlot(void)
 static void aggregatorClearSlot(struct AggregatorEffect* slot)
 {
     if (!slot) return;
-    slot->used        = 0;
+    slot->used         = 0;
     slot->aggregatorKid= -1;
-    slot->realDevId   = -1;
-    slot->shouldStop  = 0;
-    slot->durationMs  = 0;
-    slot->ffType      = 0;
+    slot->realDevId    = -1;
+    slot->shouldStop   = 0;
+    slot->durationMs   = 0;
+    slot->ffType       = 0;
     memset(&slot->original, 0, sizeof(slot->original));
 }
 
 /*---------------------------------------------------------
  * storeUploadedEffect => aggregator => UI_END_FF_UPLOAD
+ *   If we see FF_RUMBLE => unify strong/weak => big motor is not lost.
  *--------------------------------------------------------*/
 void storeUploadedEffect(struct ff_effect* eff)
 {
@@ -248,6 +255,18 @@ void storeUploadedEffect(struct ff_effect* eff)
 
     LOG_FF("[FF] aggregator => storeUploadedEffect => aggregatorKid=%d => type=%u => replay=%u ms\n",
            eff->id, eff->type, eff->replay.length);
+
+    /* If it's a FF_RUMBLE effect => unify strong & weak so big motor doesn't vanish. */
+    if (eff->type == FF_RUMBLE) {
+        unsigned short w = eff->u.rumble.weak_magnitude;
+        unsigned short s = eff->u.rumble.strong_magnitude;
+        /* simplest approach => pick the bigger or sum them, depending on your preference */
+        unsigned short unified = (s > w) ? s : w;
+        eff->u.rumble.weak_magnitude   = unified;
+        eff->u.rumble.strong_magnitude = unified;
+        LOG_FF("[FF] aggregatorKid=%d => FF_RUMBLE => unify big/small => finalMag=%u\n",
+               eff->id, unified);
+    }
 
     /* find slot or free slot */
     struct AggregatorEffect* slot= aggregatorFindSlotByKid(eff->id);
