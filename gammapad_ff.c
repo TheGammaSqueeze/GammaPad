@@ -1,17 +1,31 @@
 /*****************************************************
  * gammapad_ff.c
  *
- * Provides a "dummy" force-feedback implementation
- * that toggles a single motor (via /sys/class/timed_output/vibrator/enable)
- * unless a real FF device is specified in gammapad_main 
- * (see g_ffPhysicalFd/g_hasPhysicalFF).
+ * Force Feedback aggregator for GammaPad.
  *
- * We forward EV_FF code=<kid> value=1 => play, 0 => stop
- * to the real device if available, else fallback toggling.
- *
- * EXTRA STEP to avoid repeated "play" from the real device:
- * On 'stop' => we forcibly do EVIOCRMFF(kid) so the real device 
- * can't keep replaying effect=0.
+ * Behavior:
+ *  - GammaPad acts as the ultimate virtual joypad, storing
+ *    aggregatorKid => effect data locally.
+ *  - On aggregator “upload,” we store the aggregatorKid
+ *    in local memory and also replicate EVIOCSFF to the
+ *    real device (same effect ID).
+ *  - On aggregator “play => code=kid => value=1,” we spawn
+ *    a thread to:
+ *      (a) log aggregator + real device “play”
+ *      (b) send (EV_FF, code=kid, value=1) to the real device
+ *      (c) sleep for replay.length ms (if > 0)
+ *      (d) if not explicitly stopped earlier, auto-stop
+ *          (EV_FF, code=kid, value=0) so the effect won’t
+ *          run forever on the real device.
+ *  - On aggregator “stop => code=kid => value=0,” we set
+ *    a “shouldStop” flag so that if there’s a thread running,
+ *    it sends a stop to real device immediately and exits.
+ *  - We do *not* remove the effect from the real device on
+ *    normal stop. Only aggregator “erase” or overwriting
+ *    the effect removes it (EVIOCRMFF).
+ *  - No EVIOCGRAB => we do *not* take exclusive access.
+ *  - We add logs for aggregatorKid and real device actions
+ *    to help you debug current states of effects.
  *****************************************************/
 
 #include "gammapad.h"
@@ -24,286 +38,331 @@
 #include <linux/input.h>
 #include <fcntl.h>
 
-#define MAX_EFFECTS 32
+/* Max aggregatorKid slots. */
+#define MAX_AGGREGATOR_EFFECTS 32
 
-/*
- * We'll store effect data in gEffects[] for local usage.
- */
-struct StoredEffect {
-    int used;               /* Whether this slot is in use */
-    int kernel_id;          /* Kernel-assigned FF effect ID */
-    unsigned int magnitude; /* 0..65535 */
-    unsigned int durationMs;/* from effect->replay.length */
+/* Each aggregatorKid is stored in a slot with effect data. */
+struct AggregatorSlot {
+    int used;
+    int aggregatorKid;
     __u16 ffType;
+    unsigned int replayLengthMs;
+    unsigned int strongMag; /* optional usage from FF_RUMBLE */
+    unsigned int weakMag;
+    /* A thread to run “play => auto-stop after replayLength.” */
+    pthread_t playThread;
+    int threadActive;  /* whether a playThread is running */
+    int shouldStop;    /* aggregator or auto-stop requests a stop */
 };
 
-static struct StoredEffect gEffects[MAX_EFFECTS];
+/* Our aggregatorKid array. */
+static struct AggregatorSlot gSlots[MAX_AGGREGATOR_EFFECTS];
 
-/*
- * If no real FF device is open, we fallback to the 'timed_output' path.
- */
-static const char* VIB_PATH= "/sys/class/timed_output/vibrator/enable";
-
-/*
- * We'll reference these externs from gammapad_main.c
- * If g_hasPhysicalFF=1, we forward events to the real motor.
- */
+/* Extern from gammapad_main. If g_ffPhysicalFd<0, no physical device is present. */
 extern int g_ffPhysicalFd;
 extern int g_hasPhysicalFF;
+extern int controllerFd;  /* aggregator side */
 
-/*
- * Also need controllerFd from gammapad_main for EVIOCRMFF calls
- */
-extern int controllerFd;
+static pthread_mutex_t g_ffMutex = PTHREAD_MUTEX_INITIALIZER;
 
-/*
- * toggleMotorRepeatedly => fallback approach using timed_output
- */
-static void toggleMotorRepeatedly(unsigned int durationMs, unsigned int magnitude)
+/* Helper: remove aggregatorKid from real device. */
+static void removeRealEffect(int aggregatorKid)
 {
-    if(!durationMs||!magnitude) return;
-
-    /* Force vibrator OFF first */
-    {
-        FILE* f0= fopen(VIB_PATH,"w");
-        if(f0){
-            fprintf(f0,"0\n");
-            fclose(f0);
-        }
-    }
-
-    unsigned long long start= getTimeMs();
-    unsigned long long end= start + durationMs;
-
-    /* approximate sleep in microseconds */
-    unsigned int sleepUs= 150000 - (unsigned int)((400000.0*magnitude)/65535.0);
-    if(sleepUs<10000) sleepUs=10000;
-
-    while(getTimeMs()<end){
-        /* turn motor ON */
-        FILE* fOn= fopen(VIB_PATH,"w");
-        if(fOn){
-            fprintf(fOn,"1\n");
-            fclose(fOn);
-        }
-        usleep(sleepUs*0.9);
-        /* turn motor OFF */
-        FILE* fOff= fopen(VIB_PATH,"w");
-        if(fOff){
-            fprintf(fOff,"0\n");
-            fclose(fOff);
-        }
-    }
+    if(g_ffPhysicalFd<0) return;
+    ioctl(g_ffPhysicalFd, EVIOCRMFF, aggregatorKid);
 }
 
 /*
- * Worker thread data for fallback timed_output approach
+ * For aggregator “upload” => minimal log.
  */
-struct EffectThreadData {
-    unsigned int magnitude;
-    unsigned int durationMs;
-    __u16 ffType;
-};
-
-static void* effectThreadFunc(void* arg)
+int dummy_upload_ff_effect(struct ff_effect* eff)
 {
-    struct EffectThreadData* ed= (struct EffectThreadData*)arg;
-    LOG_FF("[FF-Thread] Type=%u, Magnitude=%u, Duration=%u ms (timed_output fallback)\n",
-           ed->ffType, ed->magnitude, ed->durationMs);
+    if(!eff) return -1;
+    LOG_FF("[FF] aggregator: upload => aggregatorKid=%d, type=%u, replay=%u ms\n",
+           eff->id, eff->type, eff->replay.length);
+    return 0;
+}
 
-    toggleMotorRepeatedly(ed->durationMs, ed->magnitude);
-    free(ed);
+/*
+ * For aggregator “erase => aggregatorKid,” we remove from aggregator + real device.
+ */
+int dummy_erase_ff_effect(int aggregatorKid)
+{
+    LOG_FF("[FF] aggregator: erase => aggregatorKid=%d\n", aggregatorKid);
+
+    pthread_mutex_lock(&g_ffMutex);
+    for(int i=0;i<MAX_AGGREGATOR_EFFECTS;i++){
+        if(gSlots[i].used && gSlots[i].aggregatorKid== aggregatorKid){
+            /* Cancel any thread if running. */
+            if(gSlots[i].threadActive){
+                /* Mark shouldStop => the thread will auto-stop real device. */
+                gSlots[i].shouldStop=1;
+            }
+            /* Also remove aggregatorKid from aggregator. */
+            ioctl(controllerFd, EVIOCRMFF, aggregatorKid);
+            gSlots[i].used=0;
+            LOG_FF("[FF] aggregatorKid=%d => aggregator slot=%d => removed.\n", aggregatorKid,i);
+            break;
+        }
+    }
+    /* remove from real device. */
+    removeRealEffect(aggregatorKid);
+    pthread_mutex_unlock(&g_ffMutex);
+
+    return 0;
+}
+
+/* 
+ * The worker thread that handles “play => aggregatorKid => 1” logic:
+ *   1) Send EV_FF => code=aggregatorKid => value=1 to real device
+ *   2) Sleep replayLengthMs if > 0
+ *   3) If we are not told to stop early => do “stop => aggregatorKid => 0”
+ *   4) Mark thread as inactive
+ */
+static void* playThreadFunc(void* arg)
+{
+    struct AggregatorSlot* slot= (struct AggregatorSlot*)arg;
+    int kid= slot->aggregatorKid;
+
+    LOG_FF("[FF-Thread] aggregatorKid=%d => thread started => replay=%u ms\n",
+           kid, slot->replayLengthMs);
+
+    /* Step 1: start effect on real device => EV_FF => code=kid => value=1 */
+    if(g_hasPhysicalFF && g_ffPhysicalFd>=0){
+        LOG_FF("[FF-Thread] aggregatorKid=%d => real dev => PLAY(1)\n", kid);
+
+        struct input_event ev;
+        memset(&ev,0,sizeof(ev));
+        ev.type= EV_FF;
+        ev.code= kid;
+        ev.value= 1; 
+        if(write(g_ffPhysicalFd, &ev, sizeof(ev))<0){
+            LOG_FF("[FF-Thread] aggregatorKid=%d => real dev play => fail => %s\n",
+                   kid, strerror(errno));
+        } else {
+            LOG_FF("[FF-Thread] aggregatorKid=%d => real dev play => success.\n", kid);
+        }
+    }
+
+    /* Step 2: Sleep replayLengthMs if > 0. If replay=0 => indefinite. */
+    unsigned int dur= slot->replayLengthMs;
+    if(dur>0){
+        unsigned int slept=0;
+        while(slept < dur && !slot->shouldStop){
+            unsigned int chunk= (dur - slept)>200 ? 200 : (dur - slept);
+            usleep(chunk*1000);
+            slept+= chunk;
+        }
+    } else {
+        /* indefinite => wait until aggregator or user calls “stop => aggregatorKid => 0”. */
+        while(!slot->shouldStop){
+            usleep(200*1000); /* 200ms chunk checks */
+        }
+    }
+
+    /* Step 3: if we have not been told to stop => aggregatorKid => 0 => do it automatically. */
+    if(!slot->shouldStop){
+        /* Auto-stop after replayLength. */
+        LOG_FF("[FF-Thread] aggregatorKid=%d => auto-stop after replay=%u ms\n",
+               kid, dur);
+    }
+
+    /* Either aggregator user called “stop => aggregatorKid => 0” or we’re auto-stopping. */
+    if(g_hasPhysicalFF && g_ffPhysicalFd>=0){
+        LOG_FF("[FF-Thread] aggregatorKid=%d => real dev => STOP(0)\n", kid);
+
+        struct input_event evStop;
+        memset(&evStop,0,sizeof(evStop));
+        evStop.type= EV_FF;
+        evStop.code= kid;
+        evStop.value=0; 
+        if(write(g_ffPhysicalFd, &evStop, sizeof(evStop))<0){
+            LOG_FF("[FF-Thread] aggregatorKid=%d => real dev stop => fail => %s\n",
+                   kid, strerror(errno));
+        } else {
+            LOG_FF("[FF-Thread] aggregatorKid=%d => real dev stop => success.\n", kid);
+        }
+    }
+
+    pthread_mutex_lock(&g_ffMutex);
+    slot->threadActive= 0;
+    slot->shouldStop= 0;
+    pthread_mutex_unlock(&g_ffMutex);
+
+    LOG_FF("[FF-Thread] aggregatorKid=%d => thread exit.\n", kid);
     return NULL;
 }
 
 /*
- * storeUploadedEffect => after UI_END_FF_UPLOAD
+ * storeUploadedEffect => aggregator “upload => aggregatorKid.” 
+ *  - remove aggregatorKid from aggregator if exists
+ *  - create aggregator slot => store replay length, magnitudes, etc.
+ *  - replicate aggregatorKid => real device => EVIOCSFF => newE.id= aggregatorKid
  */
 void storeUploadedEffect(struct ff_effect* eff)
 {
     if(!eff) return;
-
     int kid= eff->id;
-    LOG_FF("[FF] storeUploadedEffect => kid=%d\n", kid);
 
-    /* remove existing effect with same kid if any */
-    for(int i=0; i<MAX_EFFECTS; i++){
-        if(gEffects[i].used && gEffects[i].kernel_id==kid){
-            LOG_FF("[FF] Overwriting existing effect kid=%d in slot=%d\n", kid, i);
+    LOG_FF("[FF] aggregator: storeUploadedEffect => aggregatorKid=%d => type=%u => replay=%u ms\n",
+           kid, eff->type, eff->replay.length);
+
+    pthread_mutex_lock(&g_ffMutex);
+
+    /* remove aggregatorKid from aggregator if it exists => also remove from real dev. */
+    for(int i=0; i<MAX_AGGREGATOR_EFFECTS; i++){
+        if(gSlots[i].used && gSlots[i].aggregatorKid == kid){
+            LOG_FF("[FF] aggregatorKid=%d => overwriting old => remove aggregator side.\n", kid);
             ioctl(controllerFd, EVIOCRMFF, kid);
-            gEffects[i].used=0;
+            removeRealEffect(kid);
+            gSlots[i].used=0;
         }
     }
 
-    /* find free slot or fallback to 0 */
+    /* find free slot or fallback => slot=0. */
     int idx=-1;
-    for(int i=0; i<MAX_EFFECTS; i++){
-        if(!gEffects[i].used){
+    for(int i=0; i<MAX_AGGREGATOR_EFFECTS; i++){
+        if(!gSlots[i].used){
+            idx= i;
+            break;
+        }
+    }
+    if(idx<0){
+        idx= 0;
+        LOG_FF("[FF] aggregatorKid=%d => no free slot => overwriting slot=0.\n", kid);
+        ioctl(controllerFd, EVIOCRMFF, gSlots[0].aggregatorKid);
+        removeRealEffect(gSlots[0].aggregatorKid);
+        gSlots[0].used=0;
+    }
+
+    /* fill aggregator slot. */
+    gSlots[idx].used=1;
+    gSlots[idx].aggregatorKid= kid;
+    gSlots[idx].ffType= eff->type;
+    gSlots[idx].replayLengthMs= eff->replay.length;
+    gSlots[idx].threadActive= 0;
+    gSlots[idx].shouldStop= 0;
+
+    /* parse out rumble magnitudes if needed. */
+    gSlots[idx].strongMag= 0;
+    gSlots[idx].weakMag= 0;
+
+    if(eff->type==FF_RUMBLE){
+        gSlots[idx].strongMag= eff->u.rumble.strong_magnitude;
+        gSlots[idx].weakMag= eff->u.rumble.weak_magnitude;
+    }
+
+    LOG_FF("[FF] aggregatorKid=%d => aggregator slot=%d => replay=%u ms => type=%u\n",
+           kid, idx, eff->replay.length, eff->type);
+
+    /* replicate aggregatorKid => real device if present. */
+    if(!g_hasPhysicalFF || g_ffPhysicalFd<0){
+        LOG_FF("[FF] no real device => ignoring EVIOCSFF.\n");
+        pthread_mutex_unlock(&g_ffMutex);
+        return;
+    }
+
+    struct ff_effect newE;
+    memset(&newE,0,sizeof(newE));
+    newE.id= kid; /* same aggregatorKid => real dev. */
+    newE.type= eff->type;
+    newE.replay.length= eff->replay.length;
+    newE.replay.delay= 0;
+
+    switch(eff->type){
+    case FF_RUMBLE:
+        newE.u.rumble.strong_magnitude= eff->u.rumble.strong_magnitude;
+        newE.u.rumble.weak_magnitude= eff->u.rumble.weak_magnitude;
+        break;
+    case FF_CONSTANT:
+        newE.u.constant.level= eff->u.constant.level;
+        newE.u.constant.envelope= eff->u.constant.envelope;
+        break;
+    case FF_PERIODIC:
+        newE.u.periodic.waveform= eff->u.periodic.waveform;
+        newE.u.periodic.magnitude= eff->u.periodic.magnitude;
+        newE.u.periodic.offset= eff->u.periodic.offset;
+        newE.u.periodic.phase= eff->u.periodic.phase;
+        newE.u.periodic.period= eff->u.periodic.period;
+        newE.u.periodic.envelope= eff->u.periodic.envelope;
+        break;
+    case FF_RAMP:
+        newE.u.ramp.start_level= eff->u.ramp.start_level;
+        newE.u.ramp.end_level= eff->u.ramp.end_level;
+        newE.u.ramp.envelope= eff->u.ramp.envelope;
+        break;
+    case FF_SPRING:
+    case FF_DAMPER:
+    case FF_INERTIA:
+    case FF_FRICTION:
+        for(int i=0;i<FF_MAX_EFFECTS;i++){
+            newE.u.condition[i]= eff->u.condition[i];
+        }
+        break;
+    default:
+        break;
+    }
+
+    int rc= ioctl(g_ffPhysicalFd, EVIOCSFF, &newE);
+    if(rc<0){
+        LOG_FF("[FF] aggregatorKid=%d => EVIOCSFF => fail => %s\n",
+               kid, strerror(errno));
+    } else {
+        LOG_FF("[FF] aggregatorKid=%d => EVIOCSFF => success.\n", kid);
+    }
+
+    pthread_mutex_unlock(&g_ffMutex);
+}
+
+/*
+ * ff_play_effect => aggregator “play => code=kid => value=1” or “stop => code=kid => value=0.”
+ *   - If doPlay=1 => spawn a background thread if not already running => to handle the effect.
+ *   - If doPlay=0 => set shouldStop=1 => the thread will do “stop => aggregatorKid => 0” on real device.
+ */
+void ff_play_effect(int aggregatorKid, int doPlay)
+{
+    LOG_FF("[FF] aggregator: ff_play_effect => aggregatorKid=%d => doPlay=%d\n", aggregatorKid, doPlay);
+
+    pthread_mutex_lock(&g_ffMutex);
+
+    /* find aggregatorKid in aggregator slots. */
+    int idx=-1;
+    for(int i=0;i<MAX_AGGREGATOR_EFFECTS;i++){
+        if(gSlots[i].used && gSlots[i].aggregatorKid== aggregatorKid){
             idx=i;
             break;
         }
     }
     if(idx<0){
-        idx=0;
-        if(gEffects[idx].used){
-            if(ioctl(controllerFd, EVIOCRMFF, gEffects[idx].kernel_id)==0){
-                LOG_FF("[FF] Freed old effect in slot=0 (kid=%d)\n", gEffects[idx].kernel_id);
-            }
-            gEffects[idx].used=0;
-        }
+        LOG_FF("[FF] aggregatorKid=%d => not found => ignoring.\n", aggregatorKid);
+        pthread_mutex_unlock(&g_ffMutex);
+        return;
     }
 
-    gEffects[idx].used=1;
-    gEffects[idx].kernel_id= kid;
-
-    unsigned int mag=0;
-    int isSmallMotor = 0;
-    switch(eff->type){
-    case FF_RUMBLE:{
-        unsigned int smallMotor= eff->u.rumble.weak_magnitude/2;
-        unsigned int largeMotor= eff->u.rumble.strong_magnitude/20;
-        if(largeMotor>0 && smallMotor>0){
-            mag= largeMotor;
-        } else if(largeMotor>0){
-            mag= largeMotor;
-        } else {
-            mag= smallMotor;
-            isSmallMotor = 1;
-        }
-        break;
-    }
-    case FF_CONSTANT:
-        mag= eff->u.constant.level;
-        break;
-    case FF_PERIODIC:
-        mag= eff->u.periodic.magnitude;
-        break;
-    case FF_RAMP:
-        mag= (eff->u.ramp.start_level + eff->u.ramp.end_level)/2;
-        break;
-    case FF_SPRING:
-    case FF_DAMPER:
-    case FF_INERTIA:
-        mag= (eff->u.condition[0].right_coeff + eff->u.condition[0].left_coeff)/2;
-        break;
-    default:
-        mag=20000;
-        break;
-    }
-
-    gEffects[idx].magnitude= mag;
-    gEffects[idx].durationMs= eff->replay.length/2;
-    if (isSmallMotor == 1) {gEffects[idx].durationMs= eff->replay.length/4;}
-    gEffects[idx].ffType= eff->type;
-
-    LOG_FF("[FF] Stored => slot=%d, mag=%u, dur=%u, type=%u\n",
-           idx, mag, eff->replay.length, eff->type);
-
-    /* If we have a real FF device => replicate upload. */
-    if(g_hasPhysicalFF && g_ffPhysicalFd>=0){
-        struct ff_effect copy= *eff;
-        copy.id= -1; 
-        if(ioctl(g_ffPhysicalFd, EVIOCSFF, &copy)==0){
-            LOG_FF("[FF] Also uploaded effect to real FF device.\n");
-        } else {
-            LOG_FF("[FF] EVIOCSFF to real dev => %s\n", strerror(errno));
-        }
-    }
-}
-
-int dummy_upload_ff_effect(struct ff_effect* eff)
-{
-    if(!eff) return -1;
-    LOG_FF("[FF] Upload => type=%u, replay=%u ms\n", eff->type, eff->replay.length);
-    return 0;
-}
-
-int dummy_erase_ff_effect(int kernel_id)
-{
-    LOG_FF("[FF] Erase => kid=%d\n", kernel_id);
-    for(int i=0; i<MAX_EFFECTS; i++){
-        if(gEffects[i].used && gEffects[i].kernel_id==kernel_id){
-            if(ioctl(controllerFd, EVIOCRMFF, kernel_id)==0){
-                LOG_FF("[FF] Freed slot for kid=%d\n", kernel_id);
-            }
-            gEffects[i].used=0;
-            break;
-        }
-    }
-    /* also remove from real FF device if open */
-    if(g_hasPhysicalFF && g_ffPhysicalFd>=0){
-        if(ioctl(g_ffPhysicalFd, EVIOCRMFF, kernel_id)==0){
-            LOG_FF("[FF] Freed effect on real dev => kid=%d\n", kernel_id);
-        }
-    }
-    return 0;
-}
-
-/*
- * ff_play_effect => EV_FF code=<kid> value=1 => play, 0 => stop
- *
- * To avoid the device re-sending play for kid=0, on stop we forcibly do EVIOCRMFF
- * on the real device for that effect. This prevents lingering replays.
- */
-void ff_play_effect(int kid, int doPlay)
-{
     if(doPlay){
-        for(int i=0; i<MAX_EFFECTS; i++){
-            if(gEffects[i].used && gEffects[i].kernel_id==kid){
-                if(g_hasPhysicalFF && g_ffPhysicalFd>=0){
-                    /* forward EV_FF => real device => no fallback */
-                    struct input_event play;
-                    memset(&play,0,sizeof(play));
-                    play.type= EV_FF;
-                    play.code= kid;
-                    play.value=1;
-                    if(write(g_ffPhysicalFd, &play, sizeof(play))<0){
-                        LOG_FF("[FF] Real dev play => %s\n", strerror(errno));
-                    } else {
-                        LOG_FF("[FF] Real dev play => kid=%d\n", kid);
-                    }
-                } else {
-                    /* fallback => timed_output toggling */
-                    struct EffectThreadData* ed= calloc(1,sizeof(*ed));
-                    if(!ed){
-                        LOG_FF("[FF] Allocation fail => kid=%d\n", kid);
-                        return;
-                    }
-                    ed->magnitude= gEffects[i].magnitude;
-                    ed->durationMs= gEffects[i].durationMs;
-                    ed->ffType= gEffects[i].ffType;
-
-                    pthread_t th;
-                    if(pthread_create(&th,NULL,effectThreadFunc,ed)!=0){
-                        LOG_FF("[FF] pthread_create fail => kid=%d\n", kid);
-                        free(ed);
-                        gEffects[i].used=0;
-                        return;
-                    }
-                    pthread_detach(th);
-                    LOG_FF("[FF] effect kid=%d => playing fallback.\n", kid);
-                }
-                return;
-            }
-        }
-        LOG_FF("[FF] No stored effect => kid=%d => ignoring.\n", kid);
-    } else {
-        LOG_FF("[FF] Stop effect => kid=%d\n", kid);
-        if(g_hasPhysicalFF && g_ffPhysicalFd>=0){
-            /* We write a stop event, then forcibly remove the effect so it won't keep replaying. */
-            struct input_event stop;
-            memset(&stop,0,sizeof(stop));
-            stop.type= EV_FF;
-            stop.code= kid;
-            stop.value=0;
-            if(write(g_ffPhysicalFd,&stop,sizeof(stop))<0){
-                LOG_FF("[FF] Real dev stop => %s\n", strerror(errno));
+        /* doPlay=1 => if threadActive=0 => spawn a new thread => handle the effect. */
+        if(!gSlots[idx].threadActive){
+            gSlots[idx].shouldStop=0; /* reset in case it was set */
+            gSlots[idx].threadActive=1;
+            if(pthread_create(&gSlots[idx].playThread, NULL, playThreadFunc, &gSlots[idx])!=0){
+                LOG_FF("[FF] aggregatorKid=%d => thread create fail => %s\n",
+                       aggregatorKid, strerror(errno));
+                gSlots[idx].threadActive=0;
             } else {
-                LOG_FF("[FF] Real dev stop => kid=%d\n", kid);
+                pthread_detach(gSlots[idx].playThread);
+                LOG_FF("[FF] aggregatorKid=%d => spawned new play thread => slot=%d\n",
+                       aggregatorKid, idx);
             }
-            /* forcibly remove from real device so it can't re-emit */
-            ioctl(g_ffPhysicalFd, EVIOCRMFF, kid);
+        } else {
+            /* If a thread is already active => aggregator re-play => no-op? */
+            LOG_FF("[FF] aggregatorKid=%d => thread already running => ignoring re-play.\n",
+                   aggregatorKid);
         }
-        // We do not forcibly kill fallback threads, but the effect ends naturally.
+    } else {
+        /* doPlay=0 => aggregator is requesting a stop => set shouldStop=1 => the thread will handle real dev stop. */
+        LOG_FF("[FF] aggregatorKid=%d => aggregator requests STOP => set shouldStop=1\n", aggregatorKid);
+        gSlots[idx].shouldStop=1;
     }
+
+    pthread_mutex_unlock(&g_ffMutex);
 }
