@@ -106,7 +106,7 @@ static void realDevRepeatedToggles(int realDevId,
 {
     if (!slot) return;
 
-    unsigned int duration= slot->durationMs*0.8;
+    unsigned int duration= slot->durationMs/2;
     unsigned long long start= getTimeMs();
     unsigned long long end  = start + duration;
 
@@ -134,8 +134,8 @@ static void realDevRepeatedToggles(int realDevId,
             LOG_FF("[FF-Thread] aggregatorKid=%d => real dev play => ok.\n",
                    slot->aggregatorKid);
         }
-        /* short sleep => e.g. 15ms */
-        usleep(1500);
+        /* short sleep => e.g. 60ms */
+        usleep(6000);
 
         /* EV_FF => stop=0 */
         memset(&ev,0,sizeof(ev));
