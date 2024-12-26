@@ -85,8 +85,8 @@ static void fallbackToggleMotor(unsigned int durationMs)
             fprintf(fOn, "1\n");
             fclose(fOn);
         }
-        /* Sleep a short chunk => e.g. 150ms */
-        usleep(150000);
+        /* Sleep a short chunk => e.g. 15ms */
+        usleep(15000);
 
         /* Turn OFF */
         FILE* fOff= fopen(VIB_PATH, "w");
