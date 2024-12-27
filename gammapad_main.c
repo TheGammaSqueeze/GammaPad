@@ -54,7 +54,7 @@ static struct ActiveEvent activeEvents[MAX_ACTIVE_EVENTS];
  * We'll rely on these global FDs:
  *  - controllerFd => the virtual gamepad
  *  - mouseFd      => the virtual mouse
- *  - g_physicalFd => leftover single device usage (legacy)
+ *  - g_physicalFd => leftover single-device usage (legacy)
  *
  * Also, an array of aggregator device fds => g_physFds
  * plus optional FF device => g_ffPhysicalFd
@@ -172,7 +172,7 @@ static void resetEvent(int code, enum EventType t)
     ev[1].type= EV_SYN;
     ev[1].code= SYN_REPORT;
     ev[1].value=0;
-    write(controllerFd,&ev,sizeof(ev));
+    write(controllerFd, &ev, sizeof(ev));
 }
 
 /*
@@ -366,9 +366,12 @@ static int open_physical_ff_device(const char* path);
  *   - enumerates /dev/input/event*
  *   - if we see that one of our known aggregator or ffdev devices
  *     re-appears => we close old FD => re-open new
- *   - For primary aggregator => remove the node
+ *   - For primary aggregator => remove the node ONLY if it's aggregator[0].
  *   - We do not recreate the virtual pad
  *   - We keep a local record of which event nodes exist
+ *
+ * Additionally, we do an exact name check so we do NOT remove "AYANEO Controller aya_haptic"
+ * if our aggregator is only "AYANEO Controller" (and vice versa).
  *---------------------------------------------------------------------*/
 static void* doPollForDevicesThread(void* arg)
 {
@@ -445,20 +448,30 @@ static void* doPollForDevicesThread(void* arg)
                         fprintf(stderr,"[GammaPad] Poll => recaptured ffdev => %s => fd=%d\n",
                                 fullPath, testFd);
                         add_epoll_fd(g_epfd, g_ffPhysicalFd);
-                        continue; /* done with this node */
+                        continue; /* done with this node => do not remove */
                     }
                 }
 
                 /* 2) aggregator => see if it matches one of g_allAggregatorDevices[] */
-                /* We'll do a naive approach => attempt open. If success => this must be aggregator. */
                 for(int dIndex=0; dIndex<g_allAggCount; dIndex++){
                     int testAggFd= open_physical_device(fullPath);
                     if(testAggFd>=0){
-                        /* aggregator => close old aggregator FD(s) if we want to re-capture.
-                           In real code, you'd pick which aggregator is dIndex, etc.
-                           We'll just close them all, but that's naive. */
+                        /* Immediately read EVIOCGNAME to see if it EXACTLY matches
+                           g_allAggregatorDevices[dIndex]. If not, close and skip. */
+                        char devName[256];
+                        memset(devName, 0, sizeof(devName));
+                        if(ioctl(testAggFd, EVIOCGNAME(sizeof(devName)), devName)<0){
+                            devName[0] = '\0'; /* no name => fail */
+                        }
 
-                        /* CHANGED: properly remove from epoll. */
+                        if(strcmp(devName, g_allAggregatorDevices[dIndex])!=0){
+                            /* Not the aggregator we expect => close & continue searching. */
+                            close(testAggFd);
+                            testAggFd=-1;
+                            continue;
+                        }
+
+                        /* aggregator => close old aggregator FD(s) if we want to re-capture. */
                         for(int p=0; p<g_physCount; p++){
                             if(g_physFds[p]>=0){
                                 remove_epoll_fd(g_epfd, g_physFds[p]);
@@ -472,22 +485,29 @@ static void* doPollForDevicesThread(void* arg)
                         g_physCount=1;
                         add_epoll_fd(g_epfd, testAggFd);
 
-                        /* if primary aggregator => remove node. We'll assume dIndex==0 => primary. */
+                        /* if aggregator is the *primary* => index=0 => remove node */
                         if(dIndex==0){
+                            fprintf(stderr,"[GammaPad] Poll => recaptured aggregator => primary => removing node.\n");
                             char rmCmd[256];
                             snprintf(rmCmd,sizeof(rmCmd),"rm -f '%s'", fullPath);
                             system(rmCmd);
+                        } else {
+                            /* do NOT remove node for secondary aggregator */
+                            fprintf(stderr,"[GammaPad] Poll => recaptured aggregator => secondary => no node removal.\n");
                         }
 
-                        fprintf(stderr,"[GammaPad] Poll => recaptured aggregator => %s => fd=%d\n",
-                                fullPath, testAggFd);
+                        fprintf(stderr,"[GammaPad] Poll => recaptured aggregator => %s => fd=%d => dIndex=%d\n",
+                                fullPath, testAggFd, dIndex);
                         break; /* done checking aggregator list */
                     }
                 }
             }
         }
 
-        /* For each removed node => not in currentNodes => close FD if aggregator or ffdev. */
+        /* For each removed node => not in currentNodes => we will just log.
+           We do *not* remove or rm -f any device node here, nor do we close
+           aggregator or FF dev, because we only want to remove the primary
+           aggregator node at recapture time. */
         for(int k=0; k<knownCount; k++){
             int found=0;
             for(int i=0; i<currCount; i++){
@@ -497,10 +517,9 @@ static void* doPollForDevicesThread(void* arg)
                 }
             }
             if(!found){
-                fprintf(stderr,"[GammaPad] Poll => node removed => %s => if aggregator or ffdev => close FD.\n",
+                /* The node is removed by the system or user. We only log. */
+                fprintf(stderr,"[GammaPad] Poll => node removed => %s => ignoring.\n",
                         knownNodes[k]);
-                /* In real code, you'd see which FD was that node, remove from epoll, close it.
-                   But we haven't stored a mapping from node name->fd in this snippet. */
             }
         }
 
