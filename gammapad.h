@@ -61,4 +61,13 @@ extern int controllerFd;
  */
 extern int g_physicalFd;
 
+/*
+ * New global variables:
+ * g_ffDivisor: An integer divisor to reduce the length/duration of FF effects.
+ * g_ffMagnitudeMultiplier: A float multiplier to scale the rumble magnitude.
+ * Defaults are 1 (no change) if not specified.
+ */
+extern int g_ffDivisor;
+extern float g_ffMagnitudeMultiplier;
+
 #endif /* GAMMAPAD_H */

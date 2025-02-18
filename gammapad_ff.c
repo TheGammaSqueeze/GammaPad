@@ -11,12 +11,12 @@
  *  - For FF_RUMBLE effects, we merge large/small motor magnitudes.
  *
  * New changes:
- *  - In storeUploadedEffect, we query the physical device to check if the
- *    requested effect type is supported. If not supported, we do not attempt to upload it.
- *  - The fallbackToggleMotor function is implemented using timerfd for high-resolution timing
- *    and runs in its own thread so as not to block the main input loop.
- *  - In the physical-device branch, for FF_RUMBLE effects we now mix multiple active effects
- *    (by taking the maximum magnitude) and update the physical motor accordingly.
+ *  - In storeUploadedEffect, we check if the physical device supports the effect type.
+ *  - The fallbackToggleMotor function uses timerfd for high-resolution timing.
+ *  - For FF_RUMBLE effects, new command-line parameters adjust the replay length and magnitude.
+ *  - A throttling mechanism has been added to update_rumble_state() so that, if a game or app
+ *    continuously sends FF events (especially when using extreme --ffdiv/--ffmag values),
+ *    the physical device is updated at most once every 50ms. This prevents input unresponsiveness.
  *****************************************************/
 
 #include "gammapad.h"
@@ -170,19 +170,27 @@ static void fallbackToggleMotor(unsigned int durationMs, volatile int *shouldSto
  *   When using a physical FF device and FF_RUMBLE effects,
  *   this function mixes all active rumble effects by selecting the maximum magnitude.
  *   It then sends a single EV_FF event to update the physical motor.
+ *
+ *   To prevent flooding the input loop, we throttle updates to at most once every 50ms.
  *--------------------------------------------------------*/
 static void update_rumble_state(void)
 {
+    static unsigned long long lastUpdate = 0;
+    unsigned long long now = getTimeMs();
+    if (now - lastUpdate < 50) {  // throttle updates to once every 50ms
+        return;
+    }
+    lastUpdate = now;
+
     unsigned int maxMag = 0;
     int effectId = -1;
     int found = 0;
     /* Iterate over all aggregator slots to mix FF_RUMBLE effects */
     for (int i = 0; i < MAX_EFFECTS; i++) {
         if (gEffects[i].used && gEffects[i].ffType == FF_RUMBLE) {
-            unsigned int mag = gEffects[i].original.u.rumble.weak_magnitude; // already unified in storeUploadedEffect
+            unsigned int mag = gEffects[i].original.u.rumble.weak_magnitude; // already unified and scaled
             if (mag > maxMag) {
                 maxMag = mag;
-                /* Use the realDevId if available, else fallback to aggregatorKid */
                 effectId = (gEffects[i].realDevId >= 0) ? gEffects[i].realDevId : gEffects[i].aggregatorKid;
                 found = 1;
             }
@@ -193,9 +201,8 @@ static void update_rumble_state(void)
     ev.type = EV_FF;
     if (found && effectId >= 0) {
         ev.code = effectId;
-        /* In this design, a nonzero magnitude indicates play.
-           (The physical FF device should already have been programmed with the effect parameters.)
-           We assume that a play event with value 1 will cause the device to run at the intensity set in the effect. */
+        /* In this design, a play event with value 1 will run the effect at the pre-programmed magnitude.
+           (The physical FF device should have already been programmed with the effect parameters.) */
         ev.value = 1;
     } else {
         /* No active rumble effect: send a stop event.
@@ -227,11 +234,8 @@ static void* aggregatorPlayThread(void* arg)
     int aggregatorKid = slot->aggregatorKid;
     unsigned int duration = slot->durationMs;
     
-    LOG_FF("[FF-Thread] aggregatorKid=%d, starting fallback effect for %u ms\n",
-           aggregatorKid, duration);
-    
+    LOG_FF("[FF-Thread] aggregatorKid=%d, starting fallback effect for %u ms\n", aggregatorKid, duration);
     fallbackToggleMotor(duration, &slot->shouldStop);
-    
     LOG_FF("[FF-Thread] aggregatorKid=%d, fallback effect completed\n", aggregatorKid);
     return NULL;
 }
@@ -284,9 +288,9 @@ static void aggregatorClearSlot(struct AggregatorEffect* slot)
  *   Called on UI_END_FF_UPLOAD to store the effect in an aggregator slot.
  *   For FF_RUMBLE effects, merges strong and weak magnitudes.
  *
- * New change: Before uploading the effect to the physical device,
- * test whether the physical device supports the requested effect type.
- * If not supported, do not attempt EVIOCSFF.
+ *   New change: Before uploading the effect to the physical device,
+ *   we adjust the replay length by dividing by g_ffDivisor and
+ *   scale the rumble magnitude by multiplying by g_ffMagnitudeMultiplier.
  *--------------------------------------------------------*/
 void storeUploadedEffect(struct ff_effect* eff)
 {
@@ -297,10 +301,17 @@ void storeUploadedEffect(struct ff_effect* eff)
         unsigned short w = eff->u.rumble.weak_magnitude;
         unsigned short s = eff->u.rumble.strong_magnitude;
         unsigned short unified = (s > w) ? s : w;
-        eff->u.rumble.weak_magnitude   = unified;
-        eff->u.rumble.strong_magnitude = unified;
-        LOG_FF("[FF] aggregatorKid=%d => FF_RUMBLE => unify big/small => finalMag=%u\n",
-               eff->id, unified);
+        unsigned int adjustedMag = (unsigned int)(unified * g_ffMagnitudeMultiplier);
+        eff->u.rumble.weak_magnitude = adjustedMag;
+        eff->u.rumble.strong_magnitude = adjustedMag;
+        LOG_FF("[FF] aggregatorKid=%d => FF_RUMBLE => unified=%u, multiplier=%f, finalMag=%u\n",
+               eff->id, unified, g_ffMagnitudeMultiplier, adjustedMag);
+    }
+    if (g_ffDivisor != 1) {
+       unsigned int origLen = eff->replay.length;
+       eff->replay.length = eff->replay.length / g_ffDivisor;
+       LOG_FF("[FF] aggregatorKid=%d => effect length divided by %d: %u -> %u\n",
+               eff->id, g_ffDivisor, origLen, eff->replay.length);
     }
     struct AggregatorEffect* slot = aggregatorFindSlotByKid(eff->id);
     if (!slot) {
@@ -308,8 +319,7 @@ void storeUploadedEffect(struct ff_effect* eff)
     }
     if (slot->used && slot->realDevId >= 0 && g_hasPhysicalFF && g_ffPhysicalFd >= 0) {
         ioctl(g_ffPhysicalFd, EVIOCRMFF, slot->realDevId);
-        LOG_FF("[FF] aggregatorKid=%d => Freed old realDevId=%d\n",
-               slot->aggregatorKid, slot->realDevId);
+        LOG_FF("[FF] aggregatorKid=%d => Freed old realDevId=%d\n", slot->aggregatorKid, slot->realDevId);
     }
     aggregatorClearSlot(slot);
     slot->used          = 1;
@@ -320,31 +330,24 @@ void storeUploadedEffect(struct ff_effect* eff)
     slot->ffType        = eff->type;
     slot->original      = *eff;
     if (g_hasPhysicalFF && g_ffPhysicalFd >= 0) {
-        /* Only attempt to upload if the physical device supports this effect type */
         if (!test_effect_support(eff->type)) {
             LOG_FF("[FF] aggregatorKid=%d => physical device does not support effect type %u\n",
                    eff->id, eff->type);
             slot->realDevId = -1;
         } else {
             struct ff_effect copy = *eff;
-            copy.id = -1;  /* Request new ID from real device */
+            copy.id = -1;
             if (ioctl(g_ffPhysicalFd, EVIOCSFF, &copy) == 0) {
                 slot->realDevId = copy.id;
-                LOG_FF("[FF] aggregatorKid=%d => EVIOCSFF => success => realDevId=%d\n",
-                       eff->id, copy.id);
+                LOG_FF("[FF] aggregatorKid=%d => EVIOCSFF => success => realDevId=%d\n", eff->id, copy.id);
             } else {
-                LOG_FF("[FF] aggregatorKid=%d => EVIOCSFF => fail => %s\n",
-                       eff->id, strerror(errno));
+                LOG_FF("[FF] aggregatorKid=%d => EVIOCSFF => fail => %s\n", eff->id, strerror(errno));
                 slot->realDevId = -1;
             }
         }
     }
 }
 
-/*---------------------------------------------------------
- * dummy_upload_ff_effect:
- *   Dummy handler for UI_BEGIN_FF_UPLOAD.
- *--------------------------------------------------------*/
 int dummy_upload_ff_effect(struct ff_effect* eff)
 {
     if (!eff) return -1;
@@ -353,10 +356,6 @@ int dummy_upload_ff_effect(struct ff_effect* eff)
     return 0;
 }
 
-/*---------------------------------------------------------
- * dummy_erase_ff_effect:
- *   Dummy handler for UI_BEGIN_FF_ERASE.
- *--------------------------------------------------------*/
 int dummy_erase_ff_effect(int aggregatorKid)
 {
     LOG_FF("[FF] aggregator => dummy_erase_ff_effect => aggregatorKid=%d\n", aggregatorKid);
@@ -370,39 +369,24 @@ int dummy_erase_ff_effect(int aggregatorKid)
     return 0;
 }
 
-/*---------------------------------------------------------
- * ff_play_effect:
- *   Handles EV_FF events.
- *   If a physical FF device is available, we perform a direct 1:1 passthrough.
- *   For FF_RUMBLE effects, we mix active effects and update the physical motor using update_rumble_state().
- *   Otherwise, we spawn a thread that plays the effect using fallback toggling.
- *
- * Note: When using a physical ffdev motor, we do not fall back.
- *--------------------------------------------------------*/
 void ff_play_effect(int aggregatorKid, int doPlay)
 {
-    LOG_FF("[FF] aggregator => ff_play_effect => aggregatorKid=%d => doPlay=%d\n",
-           aggregatorKid, doPlay);
-    
+    LOG_FF("[FF] aggregator => ff_play_effect => aggregatorKid=%d => doPlay=%d\n", aggregatorKid, doPlay);
     struct AggregatorEffect* slot = aggregatorFindSlotByKid(aggregatorKid);
     if (!slot || !slot->used) {
         LOG_FF("[FF] aggregatorKid=%d => no used slot => ignoring\n", aggregatorKid);
         return;
     }
-    
     if (g_hasPhysicalFF && g_ffPhysicalFd >= 0) {
          if (slot->ffType == FF_RUMBLE) {
-             /* For rumble effects, update the state of this slot and then update the global rumble mix. */
              if (doPlay) {
-                 /* Mark effect as active; its magnitude was set in storeUploadedEffect */
-                 // No individual event is sent here.
+                 /* For rumble effects, simply mark the effect active.
+                    The update_rumble_state() call below will mix active effects. */
              } else {
-                 /* Effect stopped: clear the slot */
                  aggregatorClearSlot(slot);
              }
              update_rumble_state();
          } else {
-             /* For non-rumble effects, simply send the EV_FF event */
              int effectId = (slot->realDevId >= 0) ? slot->realDevId : aggregatorKid;
              struct input_event ev;
              memset(&ev, 0, sizeof(ev));
@@ -415,22 +399,19 @@ void ff_play_effect(int aggregatorKid, int doPlay)
          }
          return;
     }
-    
     /* Fallback branch (should not be reached when a physical ffdev is defined) */
     if (doPlay) {
          if (!slot->shouldStop) {
              slot->shouldStop = 1;
-             msleep(100); // wait briefly for previous thread to terminate
+             msleep(100);
          }
          slot->shouldStop = 0;
          pthread_t th;
          if (pthread_create(&th, NULL, aggregatorPlayThread, slot) != 0) {
-             LOG_FF("[FF] aggregatorKid=%d => pthread_create => fail => %s\n",
-                    aggregatorKid, strerror(errno));
+             LOG_FF("[FF] aggregatorKid=%d => pthread_create => fail => %s\n", aggregatorKid, strerror(errno));
          } else {
              pthread_detach(th);
-             LOG_FF("[FF] aggregatorKid=%d => spawned play thread => realDevId=%d\n",
-                    aggregatorKid, slot->realDevId);
+             LOG_FF("[FF] aggregatorKid=%d => spawned play thread => realDevId=%d\n", aggregatorKid, slot->realDevId);
          }
     } else {
          LOG_FF("[FF] aggregatorKid=%d => aggregator STOP => set shouldStop=1\n", aggregatorKid);
@@ -438,24 +419,18 @@ void ff_play_effect(int aggregatorKid, int doPlay)
     }
 }
 
-/*---------------------------------------------------------
- * aggregatorReuploadAllEffects:
- *   Re-upload all aggregator effects to the current physical FF device.
- *--------------------------------------------------------*/
 void aggregatorReuploadAllEffects(void)
 {
     if (!g_hasPhysicalFF || g_ffPhysicalFd < 0) {
         fprintf(stderr, "[FF] aggregatorReuploadAllEffects => no real FF device => skip.\n");
         return;
     }
-    fprintf(stderr, "[FF] aggregatorReuploadAllEffects => re-uploading aggregator slots => FD=%d\n",
-            g_ffPhysicalFd);
+    fprintf(stderr, "[FF] aggregatorReuploadAllEffects => re-uploading aggregator slots => FD=%d\n", g_ffPhysicalFd);
     for (int i = 0; i < MAX_EFFECTS; i++) {
         if (!gEffects[i].used)
             continue;
         struct ff_effect copy = gEffects[i].original;
         copy.id = -1;
-        /* Only re-upload if supported */
         if (!test_effect_support(copy.type)) {
             fprintf(stderr, "[FF] aggregatorKid=%d => effect type %u not supported; skipping reupload.\n",
                     gEffects[i].aggregatorKid, copy.type);

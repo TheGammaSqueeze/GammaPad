@@ -51,38 +51,44 @@ struct ActiveEvent {
 static struct ActiveEvent activeEvents[MAX_ACTIVE_EVENTS];
 
 /*
- * We'll rely on these global FDs:
+ * Global FDs:
  *  - controllerFd => the virtual gamepad
  *  - mouseFd      => the virtual mouse
- *  - g_physicalFd => leftover single-device usage (legacy)
- *
- * Also, an array of aggregator device fds => g_physFds
- * plus optional FF device => g_ffPhysicalFd
+ *  - g_physicalFd => legacy single-device usage
+ *  - g_physFds    => aggregator device FDs
+ *  - g_ffPhysicalFd => physical FF device FD (if any)
  */
-int controllerFd = -1;  /* Virtual gamepad */
-int mouseFd      = -1;  /* Virtual mouse   */
-int g_physicalFd = -1;  /* leftover single-device usage */
+int controllerFd = -1;
+int mouseFd      = -1;
+int g_physicalFd = -1;
 
 #define MAX_PHYSICAL_DEVS 16
 int g_physFds[MAX_PHYSICAL_DEVS];
-int g_physCount=0;
+int g_physCount = 0;
 
-int g_ffPhysicalFd= -1;
-int g_hasPhysicalFF= 0;
+int g_ffPhysicalFd = -1;
+int g_hasPhysicalFF = 0;
 
-static int g_shouldExit=0;
+static int g_shouldExit = 0;
 static void sigintHandler(int sig)
 {
     (void)sig;
-    g_shouldExit=1;
+    g_shouldExit = 1;
 }
 
-/* We'll store the aggregator device strings we got from argv. */
-static char*  g_allAggregatorDevices[MAX_PHYSICAL_DEVS];
-static int    g_allAggCount=0;
+/* Aggregator device strings */
+static char* g_allAggregatorDevices[MAX_PHYSICAL_DEVS];
+static int   g_allAggCount = 0;
 
-/* We'll store the user’s --ffdev= argument (if any). */
-static char*  g_ffArg= NULL;
+/* Optional FF device argument (--ffdev=...) */
+static char* g_ffArg = NULL;
+
+/* --- New parameter parsing --- 
+ * g_ffDivisor: divides effect duration (default = 1)
+ * g_ffMagnitudeMultiplier: multiplies effect magnitude (default = 1.0)
+ */
+int g_ffDivisor = 1;
+float g_ffMagnitudeMultiplier = 1.0f;
 
 /*
  * function prototypes from other .c files
@@ -540,36 +546,46 @@ int main(int argc, char** argv)
 {
     signal(SIGINT, sigintHandler);
 
-    /* parse argv => aggregator devices + optional --ffdev=... */
-    for(int i=1; i<argc; i++){
-        if(!strncmp(argv[i],"--ffdev=",8)){
-            g_ffArg= argv[i]+8;
+    /* Parse argv:
+     * --ffdev=...  => physical FF device
+     * --ffdiv=...  => divisor for effect duration
+     * --ffmag=...  => multiplier for effect magnitude
+     * Other arguments are treated as aggregator device names.
+     */
+    for (int i = 1; i < argc; i++) {
+        if (!strncmp(argv[i], "--ffdev=", 8)) {
+            g_ffArg = argv[i] + 8;
+        } else if (!strncmp(argv[i], "--ffdiv=", 8)) {
+            g_ffDivisor = atoi(argv[i] + 8);
+            if (g_ffDivisor <= 0) g_ffDivisor = 1;
+        } else if (!strncmp(argv[i], "--ffmag=", 8)) {
+            g_ffMagnitudeMultiplier = atof(argv[i] + 8);
+            if (g_ffMagnitudeMultiplier == 0.0f) g_ffMagnitudeMultiplier = 1.0f;
         } else {
-            if(g_allAggCount<MAX_PHYSICAL_DEVS){
+            if (g_allAggCount < MAX_PHYSICAL_DEVS) {
                 g_allAggregatorDevices[g_allAggCount] = argv[i];
                 g_allAggCount++;
             }
         }
     }
 
-    /* Attempt open ffdev if present. */
-    if(g_ffArg){
-        char* resolvedFF= maybeResolveDevicePath(g_ffArg);
-        g_ffPhysicalFd= open_physical_ff_device(resolvedFF);
+    /* Open physical FF device if specified */
+    if (g_ffArg) {
+        char* resolvedFF = maybeResolveDevicePath(g_ffArg);
+        g_ffPhysicalFd = open_physical_ff_device(resolvedFF);
         free(resolvedFF);
-        if(g_ffPhysicalFd>=0){
-            g_hasPhysicalFF=1;
+        if (g_ffPhysicalFd >= 0) {
+            g_hasPhysicalFF = 1;
         }
     }
 
-    /* open aggregator devices from arguments */
-    for(int i=0; i<g_allAggCount; i++){
-        if(g_physCount>=MAX_PHYSICAL_DEVS) break;
-        char* resolved= maybeResolveDevicePath(g_allAggregatorDevices[i]);
-        int fd= open_physical_device(resolved);
+    /* Open aggregator devices */
+    for (int i = 0; i < g_allAggCount; i++) {
+        if (g_physCount >= MAX_PHYSICAL_DEVS) break;
+        char* resolved = maybeResolveDevicePath(g_allAggregatorDevices[i]);
+        int fd = open_physical_device(resolved);
         free(resolved);
-
-        if(fd<0){
+        if (fd < 0) {
             fprintf(stderr,"[GammaPad] Could not open aggregator '%s'.\n", g_allAggregatorDevices[i]);
         } else {
             g_physFds[g_physCount] = fd;

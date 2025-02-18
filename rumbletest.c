@@ -7,6 +7,19 @@
 
 #define DURATION 6000 // Duration of each effect in milliseconds
 
+// Helper function to get the effect name based on its type
+const char* get_effect_name(struct ff_effect *effect) {
+    switch (effect->type) {
+        case FF_CONSTANT: return "FF_CONSTANT";
+        case FF_PERIODIC: return "FF_PERIODIC";
+        case FF_RAMP:     return "FF_RAMP";
+        case FF_SPRING:   return "FF_SPRING";
+        case FF_DAMPER:   return "FF_DAMPER";
+        case FF_INERTIA:  return "FF_INERTIA";
+        default:          return "UNKNOWN";
+    }
+}
+
 void play_effect(int fd, struct ff_effect *effect) {
     struct input_event play, stop;
 
@@ -21,7 +34,8 @@ void play_effect(int fd, struct ff_effect *effect) {
         return;
     }
 
-    printf("Playing effect: %d\n", effect->id);
+    // Now printing both effect id and its name
+    printf("Playing effect: %d (%s)\n", effect->id, get_effect_name(effect));
     usleep(DURATION * 1000); // Wait for the effect duration
 
     // Stop the effect
