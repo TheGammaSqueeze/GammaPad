@@ -20,6 +20,8 @@
  *  - NEW: For physical FF devices, if PWM simulation is enabled (--ffpwm) and the adjusted
  *         magnitude is below the specified maximum (default 32767), we simulate PWM in software
  *         to adjust the intensity by toggling the motor on and off using high-resolution absolute timers.
+ *  - FIX: When the PWM thread stops, we now immediately send an "off" event to the physical motor
+ *         to eliminate any lingering vibration.
  *****************************************************/
 
 #include "gammapad.h"
@@ -49,15 +51,25 @@ struct AggregatorEffect {
 
 static struct AggregatorEffect gEffects[MAX_EFFECTS];
 
-/* External variables declared in gammapad_main.c */
+/*
+ * Declared in gammapad_main.c:
+ *   g_ffPhysicalFd => physical FF device file descriptor (if any)
+ *   g_hasPhysicalFF => flag indicating physical FF device found
+ */
 extern int g_ffPhysicalFd;
 extern int g_hasPhysicalFF;
+
+/* Virtual controller FD */
 extern int controllerFd;
 
-/* Fallback vibrator sysfs path */
+/* Fallback vibrator path */
 static const char* VIB_PATH = "/sys/class/timed_output/vibrator/enable";
 
-/* Test if the physical device supports a given FF effect type */
+/*
+ * test_effect_support:
+ *   Query the physical FF device (via EVIOCGBIT) to check if the given effect
+ *   type is supported. Returns 1 if supported, 0 otherwise.
+ */
 static int test_effect_support(__u16 effect) {
     if (!(g_hasPhysicalFF && g_ffPhysicalFd >= 0))
          return 0;
@@ -69,8 +81,11 @@ static int test_effect_support(__u16 effect) {
     return (caps[index] & (1UL << bit)) ? 1 : 0;
 }
 
-/* Fallback motor toggling when no physical FF device is available.
-   This function uses timerfd (still using relative durations). */
+/*---------------------------------------------------------
+ * fallbackToggleMotor:
+ *   If EVIOCSFF fails or no physical effect is available, toggle the vibrator.
+ *   This updated version uses timerfd for high-resolution timing and checks a cancellation flag.
+ *--------------------------------------------------------*/
 static void fallbackToggleMotor(unsigned int durationMs, volatile int *shouldStop)
 {
     if (!durationMs) return;
@@ -80,6 +95,7 @@ static void fallbackToggleMotor(unsigned int durationMs, volatile int *shouldSto
         return;
     }
     
+    /* Ensure vibrator is initially off */
     FILE* fOff = fopen(VIB_PATH, "w");
     if (fOff) {
         fprintf(fOff, "0\n");
@@ -90,17 +106,19 @@ static void fallbackToggleMotor(unsigned int durationMs, volatile int *shouldSto
     unsigned long long end   = start + durationMs;
     int state = 1; // start with vibrator on
     
+    /* Turn on vibrator initially */
     FILE* fOn = fopen(VIB_PATH, "w");
     if (fOn) {
         fprintf(fOn, "1\n");
         fclose(fOn);
     }
     
+    /* Set initial timer for 15ms (on-phase) */
     struct itimerspec ts;
     ts.it_interval.tv_sec = 0;
     ts.it_interval.tv_nsec = 0;
     ts.it_value.tv_sec = 0;
-    ts.it_value.tv_nsec = 15 * 1000000; // 15ms on-phase
+    ts.it_value.tv_nsec = 15 * 1000000; // 15ms
     if (timerfd_settime(tfd, 0, &ts, NULL) < 0) {
         fprintf(stderr, "[FF] fallbackToggleMotor: timerfd_settime failed: %s\n", strerror(errno));
         close(tfd);
@@ -115,23 +133,27 @@ static void fallbackToggleMotor(unsigned int durationMs, volatile int *shouldSto
             break;
         }
         if (state == 1) {
+            /* Turn off vibrator */
             FILE* fOff = fopen(VIB_PATH, "w");
             if (fOff) {
                 fprintf(fOff, "0\n");
                 fclose(fOff);
             }
             state = 0;
+            /* Set timer for 30ms (off-phase) */
             ts.it_value.tv_sec = 0;
-            ts.it_value.tv_nsec = 30 * 1000000; // 30ms off-phase
+            ts.it_value.tv_nsec = 30 * 1000000; // 30ms
         } else {
+            /* Turn on vibrator */
             FILE* fOn = fopen(VIB_PATH, "w");
             if (fOn) {
                 fprintf(fOn, "1\n");
                 fclose(fOn);
             }
             state = 1;
+            /* Set timer for 15ms (on-phase) */
             ts.it_value.tv_sec = 0;
-            ts.it_value.tv_nsec = 15 * 1000000; // 15ms on-phase
+            ts.it_value.tv_nsec = 15 * 1000000; // 15ms
         }
         if (timerfd_settime(tfd, 0, &ts, NULL) < 0) {
             fprintf(stderr, "[FF] fallbackToggleMotor: timerfd_settime failed: %s\n", strerror(errno));
@@ -139,6 +161,7 @@ static void fallbackToggleMotor(unsigned int durationMs, volatile int *shouldSto
         }
     }
     
+    /* Ensure vibrator is off at end */
     fOff = fopen(VIB_PATH, "w");
     if (fOff) {
         fprintf(fOff, "0\n");
@@ -147,7 +170,11 @@ static void fallbackToggleMotor(unsigned int durationMs, volatile int *shouldSto
     close(tfd);
 }
 
-/* --- PWM Simulation for physical FF devices using high-resolution absolute timers --- */
+/*---------------------------------------------------------
+ * NEW PWM simulation for physical FF devices using high-resolution absolute timers.
+ * When a FF_RUMBLE effect is active with a magnitude lower than the specified max (g_ffPwmMaxMagnitude),
+ * we simulate PWM by toggling the motor on/off with a duty cycle proportional to the magnitude.
+ *--------------------------------------------------------*/
 
 /* Global PWM state variables */
 static pthread_t pwmThread;
@@ -196,7 +223,6 @@ static void* pwmThreadFunc(void* arg) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     while (!pwmThreadShouldStop) {
         sendOnToPhysical(pwmEffectId);
-        /* Calculate the absolute wakeup time for the "on" phase */
         ts.tv_nsec += pwmOnDuration * 1000000;
         while(ts.tv_nsec >= 1000000000) {
             ts.tv_sec++;
@@ -206,7 +232,6 @@ static void* pwmThreadFunc(void* arg) {
         if (pwmThreadShouldStop)
             break;
         sendOffToPhysical(pwmEffectId);
-        /* Calculate the absolute wakeup time for the "off" phase */
         ts.tv_nsec += pwmOffDuration * 1000000;
         while(ts.tv_nsec >= 1000000000) {
             ts.tv_sec++;
@@ -228,21 +253,25 @@ static void startPWMThread(void) {
     }
 }
 
-/* Stop the PWM simulation thread */
+/* Stop the PWM simulation thread.
+   FIX: After the thread stops, immediately send an "off" event so the motor stops vibrating. */
 static void stopPWMThread(void) {
     if (pwmActive) {
         pwmThreadShouldStop = 1;
         pthread_join(pwmThread, NULL);
         pwmActive = 0;
+        sendOffToPhysical(pwmEffectId);
         LOG_FF("[FF] PWM thread stopped\n");
     }
 }
 
-/* update_rumble_state:
-   This function mixes all active FF_RUMBLE effects and then either sends a constant on event
-   (if PWM is disabled or the magnitude is full) or calculates a PWM duty cycle and starts the PWM thread.
-   Updates are throttled to at most once every 50ms.
-*/
+/*---------------------------------------------------------
+ * update_rumble_state:
+ *   This function mixes all active FF_RUMBLE effects by selecting the maximum magnitude.
+ *   It then either sends a constant on event (if PWM is disabled or the magnitude is full) or,
+ *   for lower intensities when PWM is enabled, calculates a PWM duty cycle and starts the PWM thread.
+ *   Updates are throttled to at most once every 50ms.
+ *--------------------------------------------------------*/
 static void update_rumble_state(void) {
     static unsigned long long lastUpdate = 0;
     unsigned long long now = getTimeMs();
@@ -285,7 +314,7 @@ static void update_rumble_state(void) {
         }
         return;
     }
-    /* Use a fixed PWM period (e.g. 45ms) and compute on-time proportionally */
+    /* Use a fixed PWM period (45ms) and compute on-time proportionally */
     #define PWM_PERIOD_MS 45
     unsigned int onDuration = (maxMag * PWM_PERIOD_MS) / g_ffPwmMaxMagnitude;
     unsigned int offDuration = PWM_PERIOD_MS - onDuration;
@@ -295,7 +324,11 @@ static void update_rumble_state(void) {
     }
 }
 
-/* aggregatorPlayThread: used only for fallback when no physical FF device is defined */
+/*---------------------------------------------------------
+ * aggregatorPlayThread:
+ *   Plays an effect for the intended duration using fallback toggling.
+ *   This thread is spawned only when no physical FF device is defined.
+ *--------------------------------------------------------*/
 static void* aggregatorPlayThread(void* arg) {
     struct AggregatorEffect* slot = (struct AggregatorEffect*)arg;
     if (!slot) return NULL;
@@ -307,7 +340,10 @@ static void* aggregatorPlayThread(void* arg) {
     return NULL;
 }
 
-/* Find an aggregator slot by its effect ID */
+/*---------------------------------------------------------
+ * aggregatorFindSlotByKid:
+ *   Locate the aggregator slot for a given effect ID.
+ *--------------------------------------------------------*/
 static struct AggregatorEffect* aggregatorFindSlotByKid(int kid) {
     if (kid < 0) return NULL;
     for (int i = 0; i < MAX_EFFECTS; i++) {
@@ -317,7 +353,10 @@ static struct AggregatorEffect* aggregatorFindSlotByKid(int kid) {
     return NULL;
 }
 
-/* Find a free aggregator slot; if none free, reuse slot 0 */
+/*---------------------------------------------------------
+ * aggregatorFindFreeSlot:
+ *   Find the first available aggregator slot (or reuse slot 0 if needed).
+ *--------------------------------------------------------*/
 static struct AggregatorEffect* aggregatorFindFreeSlot(void) {
     for (int i = 0; i < MAX_EFFECTS; i++){
         if (!gEffects[i].used) return &gEffects[i];
@@ -326,7 +365,10 @@ static struct AggregatorEffect* aggregatorFindFreeSlot(void) {
     return &gEffects[0];
 }
 
-/* Clear an aggregator slot */
+/*---------------------------------------------------------
+ * aggregatorClearSlot:
+ *   Reset an aggregator effect slot.
+ *--------------------------------------------------------*/
 static void aggregatorClearSlot(struct AggregatorEffect* slot) {
     if (!slot) return;
     slot->used = 0;
@@ -338,10 +380,12 @@ static void aggregatorClearSlot(struct AggregatorEffect* slot) {
     memset(&slot->original, 0, sizeof(slot->original));
 }
 
-/* storeUploadedEffect:
-   Called when a FF effect is uploaded (UI_END_FF_UPLOAD). It adjusts the replay length and scales the magnitude,
-   then stores the effect in an aggregator slot and (if possible) uploads it to the physical FF device.
-*/
+/*---------------------------------------------------------
+ * storeUploadedEffect:
+ *   Called on UI_END_FF_UPLOAD to store the effect in an aggregator slot.
+ *   For FF_RUMBLE effects, merges strong and weak magnitudes.
+ *   Before uploading to the physical device, adjusts replay length and scales magnitude.
+ *--------------------------------------------------------*/
 void storeUploadedEffect(struct ff_effect* eff) {
     if (!eff) return;
     LOG_FF("[FF] storeUploadedEffect: aggregatorKid=%d, type=%u, replay=%u ms\n",
@@ -417,7 +461,10 @@ int dummy_erase_ff_effect(int aggregatorKid) {
     return 0;
 }
 
-/* ff_play_effect: Starts or stops an FF effect based on doPlay */
+/* ff_play_effect:
+   If doPlay is true, starts the effect; if false, stops it.
+   For FF_RUMBLE effects on a physical FF device, update_rumble_state() is used.
+*/
 void ff_play_effect(int aggregatorKid, int doPlay) {
     LOG_FF("[FF] ff_play_effect: aggregatorKid=%d, doPlay=%d\n", aggregatorKid, doPlay);
     struct AggregatorEffect* slot = aggregatorFindSlotByKid(aggregatorKid);
@@ -428,7 +475,7 @@ void ff_play_effect(int aggregatorKid, int doPlay) {
     if (g_hasPhysicalFF && g_ffPhysicalFd >= 0) {
          if (slot->ffType == FF_RUMBLE) {
              if (doPlay) {
-                 /* For rumble effects on physical devices, simply update the state via update_rumble_state(). */
+                 /* For rumble effects on physical devices, simply update the state. */
              } else {
                  aggregatorClearSlot(slot);
              }
@@ -446,7 +493,7 @@ void ff_play_effect(int aggregatorKid, int doPlay) {
          }
          return;
     }
-    /* Fallback branch for when no physical FF device is defined */
+    /* Fallback branch when no physical FF device is defined */
     if (doPlay) {
          if (!slot->shouldStop) {
              slot->shouldStop = 1;
