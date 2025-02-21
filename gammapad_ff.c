@@ -16,10 +16,12 @@
  *  - For FF_RUMBLE effects, new command-line parameters adjust the replay length and magnitude.
  *  - A throttling mechanism has been added to update_rumble_state() so that, if a game or app
  *    continuously sends FF events (especially when using extreme --ffdiv/--ffmag values),
- *    the physical device is updated at most once every 50ms. This prevents input unresponsiveness.
+ *    the physical device is updated at most once every 50ms.
  *  - NEW: For physical FF devices, if PWM simulation is enabled (--ffpwm) and the adjusted
  *         magnitude is below the specified maximum (default 32767), we simulate PWM in software
  *         to adjust the intensity by toggling the motor on and off.
+ *  - NEW: When an FF effect is played, overlapping effects are prevented by recording an expiration
+ *         timestamp (expireTimeMs) and spawning a stop thread that stops the effect after its duration.
  *****************************************************/
 
 #include "gammapad.h"
@@ -38,16 +40,21 @@
 
 /* Aggregator effect slot structure */
 struct AggregatorEffect {
-    int used;             /* whether slot is in use */
-    int aggregatorKid;    /* aggregator's effect ID */
-    int realDevId;        /* real device effect ID if accepted, else -1 */
-    int shouldStop;       /* aggregator STOP => thread ends early */
-    unsigned int durationMs; /* from effect->replay.length */
-    __u16 ffType;         /* effect->type (for reference) */
-    struct ff_effect original; /* unmodified effect data */
+    int used;                 /* whether slot is in use */
+    int aggregatorKid;        /* aggregator's effect ID */
+    int realDevId;            /* real device effect ID if accepted, else -1 */
+    int shouldStop;           /* aggregator STOP => thread ends early */
+    unsigned int durationMs;  /* effect duration (adjusted) */
+    unsigned long long expireTimeMs; /* NEW: expiration time (start time + duration) */
+    int stopThreadActive;     /* NEW: flag to indicate a stop thread is active */
+    __u16 ffType;             /* effect->type (for reference) */
+    struct ff_effect original;/* unmodified effect data */
 };
 
 static struct AggregatorEffect gEffects[MAX_EFFECTS];
+
+/* Forward declaration to fix implicit declaration error */
+static void aggregatorClearSlot(struct AggregatorEffect* slot);
 
 /*
  * Declared in gammapad_main.c:
@@ -80,9 +87,7 @@ static int test_effect_support(__u16 effect) {
 }
 
 /*---------------------------------------------------------
- * fallbackToggleMotor:
- *   If EVIOCSFF fails or no physical effect is available, toggle the vibrator.
- *   This updated version uses timerfd for high-resolution timing and checks a cancellation flag.
+ * fallbackToggleMotor: [unchanged]
  *--------------------------------------------------------*/
 static void fallbackToggleMotor(unsigned int durationMs, volatile int *shouldStop)
 {
@@ -93,7 +98,6 @@ static void fallbackToggleMotor(unsigned int durationMs, volatile int *shouldSto
         return;
     }
     
-    /* Ensure vibrator is initially off */
     FILE* fOff = fopen(VIB_PATH, "w");
     if (fOff) {
         fprintf(fOff, "0\n");
@@ -102,21 +106,19 @@ static void fallbackToggleMotor(unsigned int durationMs, volatile int *shouldSto
     
     unsigned long long start = getTimeMs();
     unsigned long long end   = start + durationMs;
-    int state = 1; // start with vibrator on
+    int state = 1;
     
-    /* Turn on vibrator initially */
     FILE* fOn = fopen(VIB_PATH, "w");
     if (fOn) {
         fprintf(fOn, "1\n");
         fclose(fOn);
     }
     
-    /* Set initial timer for 15ms (on-phase) */
     struct itimerspec ts;
     ts.it_interval.tv_sec = 0;
     ts.it_interval.tv_nsec = 0;
     ts.it_value.tv_sec = 0;
-    ts.it_value.tv_nsec = 15 * 1000000; // 15ms
+    ts.it_value.tv_nsec = 15 * 1000000; 
     if (timerfd_settime(tfd, 0, &ts, NULL) < 0) {
         fprintf(stderr, "[FF] fallbackToggleMotor: timerfd_settime failed: %s\n", strerror(errno));
         close(tfd);
@@ -131,27 +133,23 @@ static void fallbackToggleMotor(unsigned int durationMs, volatile int *shouldSto
             break;
         }
         if (state == 1) {
-            /* Turn off vibrator */
             FILE* fOff = fopen(VIB_PATH, "w");
             if (fOff) {
                 fprintf(fOff, "0\n");
                 fclose(fOff);
             }
             state = 0;
-            /* Set timer for 30ms (off-phase) */
             ts.it_value.tv_sec = 0;
-            ts.it_value.tv_nsec = 30 * 1000000; // 30ms
+            ts.it_value.tv_nsec = 30 * 1000000;
         } else {
-            /* Turn on vibrator */
             FILE* fOn = fopen(VIB_PATH, "w");
             if (fOn) {
                 fprintf(fOn, "1\n");
                 fclose(fOn);
             }
             state = 1;
-            /* Set timer for 15ms (on-phase) */
             ts.it_value.tv_sec = 0;
-            ts.it_value.tv_nsec = 15 * 1000000; // 15ms
+            ts.it_value.tv_nsec = 15 * 1000000;
         }
         if (timerfd_settime(tfd, 0, &ts, NULL) < 0) {
             fprintf(stderr, "[FF] fallbackToggleMotor: timerfd_settime failed: %s\n", strerror(errno));
@@ -159,7 +157,6 @@ static void fallbackToggleMotor(unsigned int durationMs, volatile int *shouldSto
         }
     }
     
-    /* Ensure vibrator is off at end */
     fOff = fopen(VIB_PATH, "w");
     if (fOff) {
         fprintf(fOff, "0\n");
@@ -169,12 +166,8 @@ static void fallbackToggleMotor(unsigned int durationMs, volatile int *shouldSto
 }
 
 /*---------------------------------------------------------
- * NEW PWM simulation for physical FF devices.
- * When a FF_RUMBLE effect is active with a magnitude lower than the specified max (g_ffPwmMaxMagnitude),
- * we simulate PWM by toggling the motor on/off with a duty cycle proportional to the magnitude.
+ * PWM simulation for physical FF devices: [unchanged]
  *--------------------------------------------------------*/
-
-/* Global PWM state variables */
 static pthread_t pwmThread;
 static volatile int pwmThreadShouldStop = 0;
 static volatile int pwmActive = 0;
@@ -182,7 +175,6 @@ static volatile unsigned int pwmOnDuration = 0;
 static volatile unsigned int pwmOffDuration = 0;
 static volatile int pwmEffectId = -1;
 
-/* Helper functions to send on/off events to the physical FF device */
 static void sendOnToPhysical(int effectId) {
     struct input_event ev;
     memset(&ev, 0, sizeof(ev));
@@ -205,7 +197,6 @@ static void sendOffToPhysical(int effectId) {
     }
 }
 
-/* Update the global PWM parameters */
 static void setGlobalPWMParameters(unsigned int onDur, unsigned int offDur, int effectId) {
     pwmOnDuration = onDur;
     pwmOffDuration = offDur;
@@ -213,7 +204,6 @@ static void setGlobalPWMParameters(unsigned int onDur, unsigned int offDur, int 
     LOG_FF("[FF] PWM parameters updated: onDuration=%u, offDuration=%u, effectId=%d\n", onDur, offDur, effectId);
 }
 
-/* PWM thread function: continuously toggle motor on and off */
 static void* pwmThreadFunc(void* arg) {
     (void)arg;
     while (!pwmThreadShouldStop) {
@@ -227,7 +217,6 @@ static void* pwmThreadFunc(void* arg) {
     return NULL;
 }
 
-/* Start the PWM simulation thread */
 static void startPWMThread(void) {
     pwmThreadShouldStop = 0;
     if (pthread_create(&pwmThread, NULL, pwmThreadFunc, NULL) == 0) {
@@ -238,7 +227,6 @@ static void startPWMThread(void) {
     }
 }
 
-/* Stop the PWM simulation thread */
 static void stopPWMThread(void) {
     if (pwmActive) {
         pwmThreadShouldStop = 1;
@@ -249,31 +237,50 @@ static void stopPWMThread(void) {
 }
 
 /*---------------------------------------------------------
- * update_rumble_state:
- *   When using a physical FF device and FF_RUMBLE effects,
- *   this function mixes all active rumble effects by selecting the maximum magnitude.
- *   It then either sends a constant on event (if full intensity or PWM disabled)
- *   or, for lower intensities when PWM is enabled, computes a PWM duty cycle and
- *   starts a PWM thread to simulate variable intensity.
- *
- *   Updates are throttled to at most once every 50ms.
+ * NEW: ff_stop_thread - stops an effect when its duration expires.
+ * It sleeps until the slot's expireTimeMs, then, if the effect is still active,
+ * sends a stop event and clears the slot.
  *--------------------------------------------------------*/
-static void update_rumble_state(void)
-{
+static void* ff_stop_thread(void* arg) {
+    struct AggregatorEffect* slot = (struct AggregatorEffect*)arg;
+    if (!slot) return NULL;
+    unsigned long long now = getTimeMs();
+    if (slot->expireTimeMs > now) {
+        msleep((unsigned int)(slot->expireTimeMs - now));
+    }
+    if (slot->used && (getTimeMs() >= slot->expireTimeMs)) {
+         struct input_event ev;
+         memset(&ev, 0, sizeof(ev));
+         ev.type = EV_FF;
+         ev.code = (slot->realDevId >= 0) ? slot->realDevId : slot->aggregatorKid;
+         ev.value = 0;
+         if (write(g_ffPhysicalFd, &ev, sizeof(ev)) < 0) {
+             LOG_FF("[FF] ff_stop_thread: write failed: %s\n", strerror(errno));
+         }
+         aggregatorClearSlot(slot);
+         LOG_FF("[FF] ff_stop_thread: Effect %d stopped after expiration.\n", slot->aggregatorKid);
+    }
+    slot->stopThreadActive = 0;
+    return NULL;
+}
+
+/*---------------------------------------------------------
+ * update_rumble_state: [unchanged]
+ *--------------------------------------------------------*/
+static void update_rumble_state(void) {
     static unsigned long long lastUpdate = 0;
     unsigned long long now = getTimeMs();
-    if (now - lastUpdate < 50) {  // throttle updates to once every 50ms
+    if (now - lastUpdate < 50) {
         return;
     }
     lastUpdate = now;
-
+    
     unsigned int maxMag = 0;
     int effectId = -1;
     int found = 0;
-    /* Iterate over all aggregator slots to mix FF_RUMBLE effects */
     for (int i = 0; i < MAX_EFFECTS; i++) {
         if (gEffects[i].used && gEffects[i].ffType == FF_RUMBLE) {
-            unsigned int mag = gEffects[i].original.u.rumble.weak_magnitude; // already unified and scaled
+            unsigned int mag = gEffects[i].original.u.rumble.weak_magnitude;
             if (mag > maxMag) {
                 maxMag = mag;
                 effectId = (gEffects[i].realDevId >= 0) ? gEffects[i].realDevId : gEffects[i].aggregatorKid;
@@ -285,7 +292,6 @@ static void update_rumble_state(void)
     memset(&ev, 0, sizeof(ev));
     ev.type = EV_FF;
     if (!found) {
-        // No active effect: stop PWM thread if running and ensure motor is off.
         stopPWMThread();
         ev.code = (effectId >= 0) ? effectId : 0;
         ev.value = 0;
@@ -294,8 +300,6 @@ static void update_rumble_state(void)
         }
         return;
     }
-
-    /* If PWM is disabled or the effect magnitude is full, send a constant on event */
     if (!g_ffPwmEnabled || maxMag >= g_ffPwmMaxMagnitude) {
         stopPWMThread();
         ev.code = effectId;
@@ -305,35 +309,23 @@ static void update_rumble_state(void)
         }
         return;
     }
-
-    /* For lower intensity with PWM enabled, simulate PWM.
-       Use a fixed PWM period (e.g. 45ms) and compute the on-time proportionally.
-    */
     #define PWM_PERIOD_MS 45
     unsigned int onDuration = (maxMag * PWM_PERIOD_MS) / g_ffPwmMaxMagnitude;
     unsigned int offDuration = PWM_PERIOD_MS - onDuration;
-
-    /* Update global PWM parameters */
     setGlobalPWMParameters(onDuration, offDuration, effectId);
-
-    /* Start PWM thread if not already active. */
     if (!pwmActive) {
         startPWMThread();
     }
 }
 
 /*---------------------------------------------------------
- * aggregatorPlayThread:
- *   Plays an effect for the intended duration using fallback toggling.
- *   This thread is spawned only when no physical ffdev is defined.
+ * aggregatorPlayThread: [unchanged fallback branch]
  *--------------------------------------------------------*/
-static void* aggregatorPlayThread(void* arg)
-{
+static void* aggregatorPlayThread(void* arg) {
     struct AggregatorEffect* slot = (struct AggregatorEffect*)arg;
     if (!slot) return NULL;
     int aggregatorKid = slot->aggregatorKid;
     unsigned int duration = slot->durationMs;
-
     LOG_FF("[FF-Thread] aggregatorKid=%d, starting fallback effect for %u ms\n", aggregatorKid, duration);
     fallbackToggleMotor(duration, &slot->shouldStop);
     LOG_FF("[FF-Thread] aggregatorKid=%d, fallback effect completed\n", aggregatorKid);
@@ -342,10 +334,8 @@ static void* aggregatorPlayThread(void* arg)
 
 /*---------------------------------------------------------
  * aggregatorFindSlotByKid:
- *   Locate the aggregator slot for a given kid.
  *--------------------------------------------------------*/
-static struct AggregatorEffect* aggregatorFindSlotByKid(int kid)
-{
+static struct AggregatorEffect* aggregatorFindSlotByKid(int kid) {
     if (kid < 0) return NULL;
     for (int i = 0; i < MAX_EFFECTS; i++) {
         if (gEffects[i].used && gEffects[i].aggregatorKid == kid)
@@ -356,14 +346,12 @@ static struct AggregatorEffect* aggregatorFindSlotByKid(int kid)
 
 /*---------------------------------------------------------
  * aggregatorFindFreeSlot:
- *   Find the first available aggregator slot (or reuse slot 0 if needed).
  *--------------------------------------------------------*/
-static struct AggregatorEffect* aggregatorFindFreeSlot(void)
-{
+static struct AggregatorEffect* aggregatorFindFreeSlot(void) {
     for (int i = 0; i < MAX_EFFECTS; i++){
         if (!gEffects[i].used) return &gEffects[i];
     }
-    LOG_FF("[FF] aggregator => no free slot => reusing slot=0.\n");
+    LOG_FF("[FF] aggregator => no free slot, reusing slot=0.\n");
     return &gEffects[0];
 }
 
@@ -371,31 +359,26 @@ static struct AggregatorEffect* aggregatorFindFreeSlot(void)
  * aggregatorClearSlot:
  *   Reset an aggregator effect slot.
  *--------------------------------------------------------*/
-static void aggregatorClearSlot(struct AggregatorEffect* slot)
-{
+static void aggregatorClearSlot(struct AggregatorEffect* slot) {
     if (!slot) return;
-    slot->used          = 0;
+    slot->used = 0;
     slot->aggregatorKid = -1;
-    slot->realDevId     = -1;
-    slot->shouldStop    = 0;
-    slot->durationMs    = 0;
-    slot->ffType        = 0;
+    slot->realDevId = -1;
+    slot->shouldStop = 0;
+    slot->durationMs = 0;
+    slot->ffType = 0;
+    slot->expireTimeMs = 0;
+    slot->stopThreadActive = 0;
     memset(&slot->original, 0, sizeof(slot->original));
 }
 
 /*---------------------------------------------------------
  * storeUploadedEffect:
- *   Called on UI_END_FF_UPLOAD to store the effect in an aggregator slot.
- *   For FF_RUMBLE effects, merges strong and weak magnitudes.
- *
- *   New change: Before uploading the effect to the physical device,
- *   we adjust the replay length by dividing by g_ffDivisor and
- *   scale the rumble magnitude by multiplying by g_ffMagnitudeMultiplier.
+ *   Called on UI_END_FF_UPLOAD to store the effect.
  *--------------------------------------------------------*/
-void storeUploadedEffect(struct ff_effect* eff)
-{
+void storeUploadedEffect(struct ff_effect* eff) {
     if (!eff) return;
-    LOG_FF("[FF] aggregator => storeUploadedEffect => aggregatorKid=%d => type=%u => replay=%u ms\n",
+    LOG_FF("[FF] storeUploadedEffect: aggregatorKid=%d, type=%u, replay=%u ms\n",
            eff->id, eff->type, eff->replay.length);
     if (eff->type == FF_RUMBLE) {
         unsigned short w = eff->u.rumble.weak_magnitude;
@@ -404,14 +387,13 @@ void storeUploadedEffect(struct ff_effect* eff)
         unsigned int adjustedMag = (unsigned int)(unified * g_ffMagnitudeMultiplier);
         eff->u.rumble.weak_magnitude = adjustedMag;
         eff->u.rumble.strong_magnitude = adjustedMag;
-        LOG_FF("[FF] aggregatorKid=%d => FF_RUMBLE => unified=%u, multiplier=%f, finalMag=%u\n",
-               eff->id, unified, g_ffMagnitudeMultiplier, adjustedMag);
+        LOG_FF("[FF] FF_RUMBLE unified=%u, multiplier=%f, finalMag=%u\n",
+               unified, g_ffMagnitudeMultiplier, adjustedMag);
     }
     if (g_ffDivisor != 1) {
        unsigned int origLen = eff->replay.length;
        eff->replay.length = eff->replay.length / g_ffDivisor;
-       LOG_FF("[FF] aggregatorKid=%d => effect length divided by %d: %u -> %u\n",
-               eff->id, g_ffDivisor, origLen, eff->replay.length);
+       LOG_FF("[FF] effect length divided by %d: %u -> %u\n", g_ffDivisor, origLen, eff->replay.length);
     }
     struct AggregatorEffect* slot = aggregatorFindSlotByKid(eff->id);
     if (!slot) {
@@ -419,70 +401,77 @@ void storeUploadedEffect(struct ff_effect* eff)
     }
     if (slot->used && slot->realDevId >= 0 && g_hasPhysicalFF && g_ffPhysicalFd >= 0) {
         ioctl(g_ffPhysicalFd, EVIOCRMFF, slot->realDevId);
-        LOG_FF("[FF] aggregatorKid=%d => Freed old realDevId=%d\n", slot->aggregatorKid, slot->realDevId);
+        LOG_FF("[FF] Freed old effect: aggregatorKid=%d, realDevId=%d\n", slot->aggregatorKid, slot->realDevId);
     }
     aggregatorClearSlot(slot);
-    slot->used          = 1;
+    slot->used = 1;
     slot->aggregatorKid = eff->id;
-    slot->realDevId     = -1;
-    slot->shouldStop    = 0;
-    slot->durationMs    = eff->replay.length;
-    slot->ffType        = eff->type;
-    slot->original      = *eff;
+    slot->realDevId = -1;
+    slot->shouldStop = 0;
+    slot->durationMs = eff->replay.length;
+    slot->ffType = eff->type;
+    slot->original = *eff;
+    /* When the effect is played, expireTimeMs will be set */
+    slot->expireTimeMs = 0;
+    slot->stopThreadActive = 0;
     if (g_hasPhysicalFF && g_ffPhysicalFd >= 0) {
         if (!test_effect_support(eff->type)) {
-            LOG_FF("[FF] aggregatorKid=%d => physical device does not support effect type %u\n",
-                   eff->id, eff->type);
+            LOG_FF("[FF] physical device does not support effect type %u\n", eff->type);
             slot->realDevId = -1;
         } else {
             struct ff_effect copy = *eff;
             copy.id = -1;
             if (ioctl(g_ffPhysicalFd, EVIOCSFF, &copy) == 0) {
                 slot->realDevId = copy.id;
-                LOG_FF("[FF] aggregatorKid=%d => EVIOCSFF => success => realDevId=%d\n", eff->id, copy.id);
+                LOG_FF("[FF] EVIOCSFF success: realDevId=%d\n", copy.id);
             } else {
-                LOG_FF("[FF] aggregatorKid=%d => EVIOCSFF => fail => %s\n", eff->id, strerror(errno));
+                LOG_FF("[FF] EVIOCSFF fail: %s\n", strerror(errno));
                 slot->realDevId = -1;
             }
         }
     }
 }
 
-int dummy_upload_ff_effect(struct ff_effect* eff)
-{
+int dummy_upload_ff_effect(struct ff_effect* eff) {
     if (!eff) return -1;
-    LOG_FF("[FF] aggregator => dummy_upload_ff_effect => aggregatorKid=%d => type=%u => replay=%u\n",
+    LOG_FF("[FF] dummy_upload_ff_effect: aggregatorKid=%d, type=%u, replay=%u ms\n",
            eff->id, eff->type, eff->replay.length);
     return 0;
 }
 
-int dummy_erase_ff_effect(int aggregatorKid)
-{
-    LOG_FF("[FF] aggregator => dummy_erase_ff_effect => aggregatorKid=%d\n", aggregatorKid);
+int dummy_erase_ff_effect(int aggregatorKid) {
+    LOG_FF("[FF] dummy_erase_ff_effect: aggregatorKid=%d\n", aggregatorKid);
     struct AggregatorEffect* slot = aggregatorFindSlotByKid(aggregatorKid);
     if (!slot) return 0;
     if (slot->used && slot->realDevId >= 0 && g_hasPhysicalFF && g_ffPhysicalFd >= 0) {
         ioctl(g_ffPhysicalFd, EVIOCRMFF, slot->realDevId);
-        LOG_FF("[FF] Freed aggregatorKid=%d => realDevId=%d\n", aggregatorKid, slot->realDevId);
+        LOG_FF("[FF] Freed effect: aggregatorKid=%d, realDevId=%d\n", aggregatorKid, slot->realDevId);
     }
     aggregatorClearSlot(slot);
     return 0;
 }
 
-void ff_play_effect(int aggregatorKid, int doPlay)
-{
-    LOG_FF("[FF] aggregator => ff_play_effect => aggregatorKid=%d => doPlay=%d\n", aggregatorKid, doPlay);
+/*---------------------------------------------------------
+ * ff_play_effect:
+ *   When an FF event is played, we set the expiration timestamp for the effect
+ *   (expireTimeMs = current time + duration). If a stop thread is not already active,
+ *   we spawn one that will sleep until the expiration time and then send a stop event.
+ *--------------------------------------------------------*/
+void ff_play_effect(int aggregatorKid, int doPlay) {
+    LOG_FF("[FF] ff_play_effect: aggregatorKid=%d, doPlay=%d\n", aggregatorKid, doPlay);
     struct AggregatorEffect* slot = aggregatorFindSlotByKid(aggregatorKid);
     if (!slot || !slot->used) {
-        LOG_FF("[FF] aggregatorKid=%d => no used slot => ignoring\n", aggregatorKid);
+        LOG_FF("[FF] No used slot for aggregatorKid=%d; ignoring\n", aggregatorKid);
         return;
     }
     if (g_hasPhysicalFF && g_ffPhysicalFd >= 0) {
          if (slot->ffType == FF_RUMBLE) {
              if (doPlay) {
-                 /* For rumble effects on physical devices, we now simulate PWM
-                    if the magnitude is below full intensity as defined by g_ffPwmMaxMagnitude.
-                    The update_rumble_state() call below will mix active effects and, if needed, start the PWM thread. */
+                 unsigned long long now = getTimeMs();
+                 /* Set expireTimeMs to now + duration if not already set or if new duration is longer */
+                 unsigned long long newExpire = now + slot->durationMs;
+                 if (slot->expireTimeMs < newExpire)
+                     slot->expireTimeMs = newExpire;
              } else {
                  aggregatorClearSlot(slot);
              }
@@ -498,9 +487,23 @@ void ff_play_effect(int aggregatorKid, int doPlay)
                   LOG_FF("[FF] Direct passthrough write failed: %s\n", strerror(errno));
              }
          }
+         if (doPlay) {
+             if (slot->expireTimeMs == 0)
+                 slot->expireTimeMs = getTimeMs() + slot->durationMs;
+             if (!slot->stopThreadActive) {
+                 slot->stopThreadActive = 1;
+                 pthread_t th;
+                 if (pthread_create(&th, NULL, ff_stop_thread, slot) != 0) {
+                     LOG_FF("[FF] pthread_create (stop thread) failed for aggregatorKid=%d: %s\n", aggregatorKid, strerror(errno));
+                     slot->stopThreadActive = 0;
+                 } else {
+                     pthread_detach(th);
+                 }
+             }
+         }
          return;
     }
-    /* Fallback branch (should not be reached when a physical ffdev is defined) */
+    /* Fallback branch (if no physical FF device) */
     if (doPlay) {
          if (!slot->shouldStop) {
              slot->shouldStop = 1;
@@ -509,41 +512,40 @@ void ff_play_effect(int aggregatorKid, int doPlay)
          slot->shouldStop = 0;
          pthread_t th;
          if (pthread_create(&th, NULL, aggregatorPlayThread, slot) != 0) {
-             LOG_FF("[FF] aggregatorKid=%d => pthread_create => fail => %s\n", aggregatorKid, strerror(errno));
+             LOG_FF("[FF] fallback pthread_create failed for aggregatorKid=%d: %s\n", aggregatorKid, strerror(errno));
          } else {
              pthread_detach(th);
-             LOG_FF("[FF] aggregatorKid=%d => spawned play thread => realDevId=%d\n", aggregatorKid, slot->realDevId);
+             LOG_FF("[FF] Spawned fallback play thread for aggregatorKid=%d\n", aggregatorKid);
          }
     } else {
-         LOG_FF("[FF] aggregatorKid=%d => aggregator STOP => set shouldStop=1\n", aggregatorKid);
+         LOG_FF("[FF] aggregator STOP for aggregatorKid=%d\n", aggregatorKid);
          slot->shouldStop = 1;
     }
 }
 
-void aggregatorReuploadAllEffects(void)
-{
+void aggregatorReuploadAllEffects(void) {
     if (!g_hasPhysicalFF || g_ffPhysicalFd < 0) {
-        fprintf(stderr, "[FF] aggregatorReuploadAllEffects => no real FF device => skip.\n");
+        fprintf(stderr, "[FF] aggregatorReuploadAllEffects: no real FF device; skipping\n");
         return;
     }
-    fprintf(stderr, "[FF] aggregatorReuploadAllEffects => re-uploading aggregator slots => FD=%d\n", g_ffPhysicalFd);
+    fprintf(stderr, "[FF] Reuploading aggregator slots; FD=%d\n", g_ffPhysicalFd);
     for (int i = 0; i < MAX_EFFECTS; i++) {
         if (!gEffects[i].used)
             continue;
         struct ff_effect copy = gEffects[i].original;
         copy.id = -1;
         if (!test_effect_support(copy.type)) {
-            fprintf(stderr, "[FF] aggregatorKid=%d => effect type %u not supported; skipping reupload.\n",
+            fprintf(stderr, "[FF] aggregatorKid=%d: effect type %u not supported; skipping reupload\n",
                     gEffects[i].aggregatorKid, copy.type);
             gEffects[i].realDevId = -1;
             continue;
         }
         if (ioctl(g_ffPhysicalFd, EVIOCSFF, &copy) == 0) {
             gEffects[i].realDevId = copy.id;
-            fprintf(stderr, "[FF] aggregatorKid=%d => reupload => new realDevId=%d\n",
+            fprintf(stderr, "[FF] aggregatorKid=%d: reupload success, new realDevId=%d\n",
                     gEffects[i].aggregatorKid, copy.id);
         } else {
-            fprintf(stderr, "[FF] aggregatorKid=%d => reupload => fail => %s\n",
+            fprintf(stderr, "[FF] aggregatorKid=%d: reupload failed: %s\n",
                     gEffects[i].aggregatorKid, strerror(errno));
             gEffects[i].realDevId = -1;
         }
