@@ -76,6 +76,14 @@ static void sigintHandler(int sig)
     g_shouldExit = 1;
 }
 
+/* New virtual controller parameters – defaults below */
+char* g_uiname = "Xbox Wireless Controller";
+int g_uibus = BUS_BLUETOOTH;  // default; you can change to BUS_USB if desired
+int g_uivid = 0x045e;         // default vendor (Microsoft)
+int g_uiproduct = 0x02fd;     // default product (example value)
+int g_uiversion = 0x0003;     // default version
+
+
 /* Aggregator device strings */
 static char* g_allAggregatorDevices[MAX_PHYSICAL_DEVS];
 static int   g_allAggCount = 0;
@@ -564,6 +572,18 @@ int main(int argc, char** argv)
             if (g_ffPwmMaxMagnitude <= 0) g_ffPwmMaxMagnitude = 32767;
         } else if (!strcmp(argv[i], "--ffpwm")) {
             g_ffPwmEnabled = 1;
+        }
+        /* New parameters for virtual controller identification */
+        else if (!strncmp(argv[i], "--uibus=", 8)) {
+            g_uibus = atoi(argv[i] + 8);
+        } else if (!strncmp(argv[i], "--uivid=", 8)) {
+            g_uivid = (int)strtol(argv[i] + 8, NULL, 0);
+        } else if (!strncmp(argv[i], "--uiproduct=", 12)) {
+            g_uiproduct = (int)strtol(argv[i] + 12, NULL, 0);
+        } else if (!strncmp(argv[i], "--uiversion=", 12)) {
+            g_uiversion = (int)strtol(argv[i] + 12, NULL, 0);
+        } else if (!strncmp(argv[i], "--uiname=", 9)) {
+            g_uiname = argv[i] + 9;
         } else {
             if (g_allAggCount < MAX_PHYSICAL_DEVS) {
                 g_allAggregatorDevices[g_allAggCount] = argv[i];

@@ -50,33 +50,33 @@ static inline unsigned long long getTimeMs(void)
 
 /*
  * Extern: controllerFd is defined in gammapad_main.c
- * So that all other files can refer to it for EVIOCRMFF, etc.
  */
 extern int controllerFd;
 
 /*
  * Also expose g_physicalFd so we can read absmin/absmax from the captured device.
- * In multi-dev scenario, we still keep it for legacy usage, 
- * but we store multiple device fds in gammapad_main.
  */
 extern int g_physicalFd;
 
 /*
- * New global variables:
- * g_ffDivisor: An integer divisor to reduce the length/duration of FF effects.
- * g_ffMagnitudeMultiplier: A float multiplier to scale the rumble magnitude.
- * Defaults are 1 (no change) if not specified.
+ * Global FF effect adjustment variables.
  */
 extern int g_ffDivisor;
 extern float g_ffMagnitudeMultiplier;
 
 /*
- * New PWM-related globals:
- * g_ffPwmEnabled: If nonzero, enable PWM simulation for physical FF devices.
- * g_ffPwmMaxMagnitude: The maximum magnitude value that corresponds to full intensity.
- *   Defaults to 32767 if not overridden by a command-line argument.
+ * PWM globals.
  */
 extern int g_ffPwmEnabled;
 extern int g_ffPwmMaxMagnitude;
+
+/*
+ * New virtual controller parameters (set via command-line):
+ */
+extern char* g_uiname;
+extern int g_uibus;
+extern int g_uivid;
+extern int g_uiproduct;
+extern int g_uiversion;
 
 #endif /* GAMMAPAD_H */

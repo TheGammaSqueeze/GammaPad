@@ -157,11 +157,11 @@ int create_virtual_controller(int* fd_out)
     struct uinput_user_dev uidev;
     memset(&uidev, 0, sizeof(uidev));
 
-    snprintf(uidev.name, UINPUT_MAX_NAME_SIZE, "Xbox Wireless Controller");
-    uidev.id.bustype = BUS_BLUETOOTH;
-    uidev.id.vendor  = 0x045e;
-    uidev.id.product = 0x02fd;
-    uidev.id.version = 0x0003;
+    snprintf(uidev.name, UINPUT_MAX_NAME_SIZE, "%s", g_uiname);
+    uidev.id.bustype = g_uibus;
+    uidev.id.vendor  = g_uivid;
+    uidev.id.product = g_uiproduct;
+    uidev.id.version = g_uiversion;
     uidev.ff_effects_max = 32;
 
     /* Set fallback ranges for typical axes if not discovered */
