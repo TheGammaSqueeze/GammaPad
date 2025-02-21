@@ -17,6 +17,9 @@
  *  - A throttling mechanism has been added to update_rumble_state() so that, if a game or app
  *    continuously sends FF events (especially when using extreme --ffdiv/--ffmag values),
  *    the physical device is updated at most once every 50ms. This prevents input unresponsiveness.
+ *  - NEW: For physical FF devices, if PWM simulation is enabled (--ffpwm) and the adjusted
+ *         magnitude is below the specified maximum (default 32767), we simulate PWM in software
+ *         to adjust the intensity by toggling the motor on and off.
  *****************************************************/
 
 #include "gammapad.h"
@@ -100,7 +103,7 @@ static void fallbackToggleMotor(unsigned int durationMs, volatile int *shouldSto
     unsigned long long start = getTimeMs();
     unsigned long long end   = start + durationMs;
     int state = 1; // start with vibrator on
-
+    
     /* Turn on vibrator initially */
     FILE* fOn = fopen(VIB_PATH, "w");
     if (fOn) {
@@ -166,12 +169,94 @@ static void fallbackToggleMotor(unsigned int durationMs, volatile int *shouldSto
 }
 
 /*---------------------------------------------------------
+ * NEW PWM simulation for physical FF devices.
+ * When a FF_RUMBLE effect is active with a magnitude lower than the specified max (g_ffPwmMaxMagnitude),
+ * we simulate PWM by toggling the motor on/off with a duty cycle proportional to the magnitude.
+ *--------------------------------------------------------*/
+
+/* Global PWM state variables */
+static pthread_t pwmThread;
+static volatile int pwmThreadShouldStop = 0;
+static volatile int pwmActive = 0;
+static volatile unsigned int pwmOnDuration = 0;
+static volatile unsigned int pwmOffDuration = 0;
+static volatile int pwmEffectId = -1;
+
+/* Helper functions to send on/off events to the physical FF device */
+static void sendOnToPhysical(int effectId) {
+    struct input_event ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type = EV_FF;
+    ev.code = effectId;
+    ev.value = 1;
+    if (write(g_ffPhysicalFd, &ev, sizeof(ev)) < 0) {
+        LOG_FF("[FF] sendOnToPhysical: write failed: %s\n", strerror(errno));
+    }
+}
+
+static void sendOffToPhysical(int effectId) {
+    struct input_event ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type = EV_FF;
+    ev.code = effectId;
+    ev.value = 0;
+    if (write(g_ffPhysicalFd, &ev, sizeof(ev)) < 0) {
+        LOG_FF("[FF] sendOffToPhysical: write failed: %s\n", strerror(errno));
+    }
+}
+
+/* Update the global PWM parameters */
+static void setGlobalPWMParameters(unsigned int onDur, unsigned int offDur, int effectId) {
+    pwmOnDuration = onDur;
+    pwmOffDuration = offDur;
+    pwmEffectId = effectId;
+    LOG_FF("[FF] PWM parameters updated: onDuration=%u, offDuration=%u, effectId=%d\n", onDur, offDur, effectId);
+}
+
+/* PWM thread function: continuously toggle motor on and off */
+static void* pwmThreadFunc(void* arg) {
+    (void)arg;
+    while (!pwmThreadShouldStop) {
+        sendOnToPhysical(pwmEffectId);
+        msleep(pwmOnDuration);
+        if (pwmThreadShouldStop)
+            break;
+        sendOffToPhysical(pwmEffectId);
+        msleep(pwmOffDuration);
+    }
+    return NULL;
+}
+
+/* Start the PWM simulation thread */
+static void startPWMThread(void) {
+    pwmThreadShouldStop = 0;
+    if (pthread_create(&pwmThread, NULL, pwmThreadFunc, NULL) == 0) {
+        pwmActive = 1;
+        LOG_FF("[FF] PWM thread started with onDuration=%u, offDuration=%u\n", pwmOnDuration, pwmOffDuration);
+    } else {
+        LOG_FF("[FF] Failed to start PWM thread\n");
+    }
+}
+
+/* Stop the PWM simulation thread */
+static void stopPWMThread(void) {
+    if (pwmActive) {
+        pwmThreadShouldStop = 1;
+        pthread_join(pwmThread, NULL);
+        pwmActive = 0;
+        LOG_FF("[FF] PWM thread stopped\n");
+    }
+}
+
+/*---------------------------------------------------------
  * update_rumble_state:
  *   When using a physical FF device and FF_RUMBLE effects,
  *   this function mixes all active rumble effects by selecting the maximum magnitude.
- *   It then sends a single EV_FF event to update the physical motor.
+ *   It then either sends a constant on event (if full intensity or PWM disabled)
+ *   or, for lower intensities when PWM is enabled, computes a PWM duty cycle and
+ *   starts a PWM thread to simulate variable intensity.
  *
- *   To prevent flooding the input loop, we throttle updates to at most once every 50ms.
+ *   Updates are throttled to at most once every 50ms.
  *--------------------------------------------------------*/
 static void update_rumble_state(void)
 {
@@ -199,33 +284,48 @@ static void update_rumble_state(void)
     struct input_event ev;
     memset(&ev, 0, sizeof(ev));
     ev.type = EV_FF;
-    if (found && effectId >= 0) {
-        ev.code = effectId;
-        /* In this design, a play event with value 1 will run the effect at the pre-programmed magnitude.
-           (The physical FF device should have already been programmed with the effect parameters.) */
-        ev.value = 1;
-    } else {
-        /* No active rumble effect: send a stop event.
-           If an effect id exists from a previous effect, use it. */
-        for (int i = 0; i < MAX_EFFECTS; i++) {
-            if (gEffects[i].used && gEffects[i].ffType == FF_RUMBLE) {
-                effectId = (gEffects[i].realDevId >= 0) ? gEffects[i].realDevId : gEffects[i].aggregatorKid;
-                break;
-            }
-        }
-        if (effectId < 0) return; /* nothing to stop */
-        ev.code = effectId;
+    if (!found) {
+        // No active effect: stop PWM thread if running and ensure motor is off.
+        stopPWMThread();
+        ev.code = (effectId >= 0) ? effectId : 0;
         ev.value = 0;
+        if (write(g_ffPhysicalFd, &ev, sizeof(ev)) < 0) {
+            LOG_FF("[FF] update_rumble_state: write failed: %s\n", strerror(errno));
+        }
+        return;
     }
-    if (write(g_ffPhysicalFd, &ev, sizeof(ev)) < 0) {
-        LOG_FF("[FF] update_rumble_state: write failed: %s\n", strerror(errno));
+
+    /* If PWM is disabled or the effect magnitude is full, send a constant on event */
+    if (!g_ffPwmEnabled || maxMag >= g_ffPwmMaxMagnitude) {
+        stopPWMThread();
+        ev.code = effectId;
+        ev.value = 1;
+        if (write(g_ffPhysicalFd, &ev, sizeof(ev)) < 0) {
+            LOG_FF("[FF] update_rumble_state: write failed: %s\n", strerror(errno));
+        }
+        return;
+    }
+
+    /* For lower intensity with PWM enabled, simulate PWM.
+       Use a fixed PWM period (e.g. 45ms) and compute the on-time proportionally.
+    */
+    #define PWM_PERIOD_MS 45
+    unsigned int onDuration = (maxMag * PWM_PERIOD_MS) / g_ffPwmMaxMagnitude;
+    unsigned int offDuration = PWM_PERIOD_MS - onDuration;
+
+    /* Update global PWM parameters */
+    setGlobalPWMParameters(onDuration, offDuration, effectId);
+
+    /* Start PWM thread if not already active. */
+    if (!pwmActive) {
+        startPWMThread();
     }
 }
 
 /*---------------------------------------------------------
  * aggregatorPlayThread:
  *   Plays an effect for the intended duration using fallback toggling.
- *   This thread is spawned only when no physical FF device is available.
+ *   This thread is spawned only when no physical ffdev is defined.
  *--------------------------------------------------------*/
 static void* aggregatorPlayThread(void* arg)
 {
@@ -233,7 +333,7 @@ static void* aggregatorPlayThread(void* arg)
     if (!slot) return NULL;
     int aggregatorKid = slot->aggregatorKid;
     unsigned int duration = slot->durationMs;
-    
+
     LOG_FF("[FF-Thread] aggregatorKid=%d, starting fallback effect for %u ms\n", aggregatorKid, duration);
     fallbackToggleMotor(duration, &slot->shouldStop);
     LOG_FF("[FF-Thread] aggregatorKid=%d, fallback effect completed\n", aggregatorKid);
@@ -380,8 +480,9 @@ void ff_play_effect(int aggregatorKid, int doPlay)
     if (g_hasPhysicalFF && g_ffPhysicalFd >= 0) {
          if (slot->ffType == FF_RUMBLE) {
              if (doPlay) {
-                 /* For rumble effects, simply mark the effect active.
-                    The update_rumble_state() call below will mix active effects. */
+                 /* For rumble effects on physical devices, we now simulate PWM
+                    if the magnitude is below full intensity as defined by g_ffPwmMaxMagnitude.
+                    The update_rumble_state() call below will mix active effects and, if needed, start the PWM thread. */
              } else {
                  aggregatorClearSlot(slot);
              }

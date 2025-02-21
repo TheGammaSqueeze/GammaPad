@@ -90,6 +90,13 @@ static char* g_ffArg = NULL;
 int g_ffDivisor = 1;
 float g_ffMagnitudeMultiplier = 1.0f;
 
+/* NEW PWM parameters:
+ * g_ffPwmEnabled: enable PWM simulation for physical FF devices (default disabled)
+ * g_ffPwmMaxMagnitude: maximum magnitude value corresponding to full intensity (default = 32767)
+ */
+int g_ffPwmEnabled = 0;
+int g_ffPwmMaxMagnitude = 32767;
+
 /*
  * function prototypes from other .c files
  */
@@ -367,18 +374,7 @@ extern int open_physical_device(const char* path);
 /* We'll also do the "open_physical_ff_device" for FF dev. */
 static int open_physical_ff_device(const char* path);
 
-/*----------------------------------------------------------------------
- * doPollForDevicesThread => runs in a separate thread, polls every 1s
- *   - enumerates /dev/input/event*
- *   - if we see that one of our known aggregator or ffdev devices
- *     re-appears => we close old FD => re-open new
- *   - For primary aggregator => remove the node ONLY if it's aggregator[0].
- *   - We do not recreate the virtual pad
- *   - We keep a local record of which event nodes exist
- *
- * Additionally, we do an exact name check so we do NOT remove "AYANEO Controller aya_haptic"
- * if our aggregator is only "AYANEO Controller" (and vice versa).
- *---------------------------------------------------------------------*/
+/*----------------------------------------------------------------------*/
 static void* doPollForDevicesThread(void* arg)
 {
     (void)arg;
@@ -550,6 +546,8 @@ int main(int argc, char** argv)
      * --ffdev=...  => physical FF device
      * --ffdiv=...  => divisor for effect duration
      * --ffmag=...  => multiplier for effect magnitude
+     * --ffpwm      => enable PWM simulation for physical FF devices (flag)
+     * --ffpwmmax=... => maximum magnitude corresponding to full intensity (default 32767)
      * Other arguments are treated as aggregator device names.
      */
     for (int i = 1; i < argc; i++) {
@@ -561,6 +559,11 @@ int main(int argc, char** argv)
         } else if (!strncmp(argv[i], "--ffmag=", 8)) {
             g_ffMagnitudeMultiplier = atof(argv[i] + 8);
             if (g_ffMagnitudeMultiplier == 0.0f) g_ffMagnitudeMultiplier = 1.0f;
+        } else if (!strncmp(argv[i], "--ffpwmmax=", 11)) {
+            g_ffPwmMaxMagnitude = atoi(argv[i] + 11);
+            if (g_ffPwmMaxMagnitude <= 0) g_ffPwmMaxMagnitude = 32767;
+        } else if (!strcmp(argv[i], "--ffpwm")) {
+            g_ffPwmEnabled = 1;
         } else {
             if (g_allAggCount < MAX_PHYSICAL_DEVS) {
                 g_allAggregatorDevices[g_allAggCount] = argv[i];

@@ -70,4 +70,13 @@ extern int g_physicalFd;
 extern int g_ffDivisor;
 extern float g_ffMagnitudeMultiplier;
 
+/*
+ * New PWM-related globals:
+ * g_ffPwmEnabled: If nonzero, enable PWM simulation for physical FF devices.
+ * g_ffPwmMaxMagnitude: The maximum magnitude value that corresponds to full intensity.
+ *   Defaults to 32767 if not overridden by a command-line argument.
+ */
+extern int g_ffPwmEnabled;
+extern int g_ffPwmMaxMagnitude;
+
 #endif /* GAMMAPAD_H */
