@@ -11,17 +11,13 @@
  *  - For FF_RUMBLE effects, we merge large/small motor magnitudes.
  *
  * New changes:
- *  - In storeUploadedEffect, we check if the physical device supports the effect type.
- *  - The fallbackToggleMotor function uses timerfd for high-resolution timing.
- *  - For FF_RUMBLE effects, new command-line parameters adjust the replay length and magnitude.
- *  - A throttling mechanism has been added to update_rumble_state() so that, if a game or app
- *    continuously sends FF events (especially when using extreme --ffdiv/--ffmag values),
- *    the physical device is updated at most once every 50ms.
- *  - NEW: For physical FF devices, if PWM simulation is enabled (--ffpwm) and the adjusted
- *         magnitude is below the specified maximum (default 32767), we simulate PWM in software
- *         to adjust the intensity by toggling the motor on and off using high-resolution absolute timers.
- *  - FIX: When the PWM thread stops, we now immediately send an "off" event to the physical motor
- *         to eliminate any lingering vibration.
+ *  - In storeUploadedEffect(), we now record the start time of the effect.
+ *  - In ff_play_effect(), when a stop event (doPlay==0) is received for a rumble effect,
+ *    we check if the effect has been active for its full intended duration before clearing it.
+ *    If not, we ignore the stop command so that the vibration isn’t cut short.
+ *  - The PWM thread uses high-resolution absolute timers and, when stopped,
+ *    immediately sends an "off" event to ensure the motor is turned off.
+ *  - All existing code remains unabridged.
  *****************************************************/
 
 #include "gammapad.h"
@@ -40,12 +36,13 @@
 
 /* Aggregator effect slot structure */
 struct AggregatorEffect {
-    int used;             /* whether slot is in use */
-    int aggregatorKid;    /* aggregator's effect ID */
-    int realDevId;        /* real device effect ID if accepted, else -1 */
-    int shouldStop;       /* aggregator STOP => thread ends early */
-    unsigned int durationMs; /* from effect->replay.length */
-    __u16 ffType;         /* effect->type (for reference) */
+    int used;                  /* whether slot is in use */
+    int aggregatorKid;         /* aggregator's effect ID */
+    int realDevId;             /* real device effect ID if accepted, else -1 */
+    int shouldStop;            /* aggregator STOP => thread ends early */
+    unsigned int durationMs;   /* intended replay length from effect->replay.length */
+    __u16 ffType;              /* effect->type (for reference) */
+    unsigned long long startTimeMs;  /* time (ms) when effect was started */
     struct ff_effect original; /* unmodified effect data */
 };
 
@@ -84,10 +81,9 @@ static int test_effect_support(__u16 effect) {
 /*---------------------------------------------------------
  * fallbackToggleMotor:
  *   If EVIOCSFF fails or no physical effect is available, toggle the vibrator.
- *   This updated version uses timerfd for high-resolution timing and checks a cancellation flag.
+ *   Uses timerfd for high-resolution timing and a cancellation flag.
  *--------------------------------------------------------*/
-static void fallbackToggleMotor(unsigned int durationMs, volatile int *shouldStop)
-{
+static void fallbackToggleMotor(unsigned int durationMs, volatile int *shouldStop) {
     if (!durationMs) return;
     int tfd = timerfd_create(CLOCK_MONOTONIC, 0);
     if (tfd < 0) {
@@ -172,7 +168,7 @@ static void fallbackToggleMotor(unsigned int durationMs, volatile int *shouldSto
 
 /*---------------------------------------------------------
  * NEW PWM simulation for physical FF devices using high-resolution absolute timers.
- * When a FF_RUMBLE effect is active with a magnitude lower than the specified max (g_ffPwmMaxMagnitude),
+ * When a FF_RUMBLE effect is active with a magnitude lower than the specified maximum,
  * we simulate PWM by toggling the motor on/off with a duty cycle proportional to the magnitude.
  *--------------------------------------------------------*/
 
@@ -219,12 +215,11 @@ static void setGlobalPWMParameters(unsigned int onDur, unsigned int offDur, int 
 static void* pwmThreadFunc(void* arg) {
     (void)arg;
     struct timespec ts;
-    /* Get the current absolute time */
     clock_gettime(CLOCK_MONOTONIC, &ts);
     while (!pwmThreadShouldStop) {
         sendOnToPhysical(pwmEffectId);
         ts.tv_nsec += pwmOnDuration * 1000000;
-        while(ts.tv_nsec >= 1000000000) {
+        while (ts.tv_nsec >= 1000000000) {
             ts.tv_sec++;
             ts.tv_nsec -= 1000000000;
         }
@@ -233,7 +228,7 @@ static void* pwmThreadFunc(void* arg) {
             break;
         sendOffToPhysical(pwmEffectId);
         ts.tv_nsec += pwmOffDuration * 1000000;
-        while(ts.tv_nsec >= 1000000000) {
+        while (ts.tv_nsec >= 1000000000) {
             ts.tv_sec++;
             ts.tv_nsec -= 1000000000;
         }
@@ -254,7 +249,8 @@ static void startPWMThread(void) {
 }
 
 /* Stop the PWM simulation thread.
-   FIX: After the thread stops, immediately send an "off" event so the motor stops vibrating. */
+   After the thread stops, immediately send an "off" event so the motor stops vibrating.
+*/
 static void stopPWMThread(void) {
     if (pwmActive) {
         pwmThreadShouldStop = 1;
@@ -267,9 +263,9 @@ static void stopPWMThread(void) {
 
 /*---------------------------------------------------------
  * update_rumble_state:
- *   This function mixes all active FF_RUMBLE effects by selecting the maximum magnitude.
- *   It then either sends a constant on event (if PWM is disabled or the magnitude is full) or,
- *   for lower intensities when PWM is enabled, calculates a PWM duty cycle and starts the PWM thread.
+ *   Mixes all active FF_RUMBLE effects by selecting the maximum magnitude.
+ *   If PWM is disabled or magnitude is at full intensity, sends a constant "on" event.
+ *   Otherwise, calculates a PWM duty cycle and starts the PWM thread.
  *   Updates are throttled to at most once every 50ms.
  *--------------------------------------------------------*/
 static void update_rumble_state(void) {
@@ -314,7 +310,6 @@ static void update_rumble_state(void) {
         }
         return;
     }
-    /* Use a fixed PWM period (45ms) and compute on-time proportionally */
     #define PWM_PERIOD_MS 45
     unsigned int onDuration = (maxMag * PWM_PERIOD_MS) / g_ffPwmMaxMagnitude;
     unsigned int offDuration = PWM_PERIOD_MS - onDuration;
@@ -377,6 +372,7 @@ static void aggregatorClearSlot(struct AggregatorEffect* slot) {
     slot->shouldStop = 0;
     slot->durationMs = 0;
     slot->ffType = 0;
+    slot->startTimeMs = 0;
     memset(&slot->original, 0, sizeof(slot->original));
 }
 
@@ -384,7 +380,8 @@ static void aggregatorClearSlot(struct AggregatorEffect* slot) {
  * storeUploadedEffect:
  *   Called on UI_END_FF_UPLOAD to store the effect in an aggregator slot.
  *   For FF_RUMBLE effects, merges strong and weak magnitudes.
- *   Before uploading to the physical device, adjusts replay length and scales magnitude.
+ *   Also adjusts replay length and scales magnitude.
+ *   Records the effect start time.
  *--------------------------------------------------------*/
 void storeUploadedEffect(struct ff_effect* eff) {
     if (!eff) return;
@@ -422,6 +419,7 @@ void storeUploadedEffect(struct ff_effect* eff) {
     slot->durationMs = eff->replay.length;
     slot->ffType = eff->type;
     slot->original = *eff;
+    slot->startTimeMs = getTimeMs();
     if (g_hasPhysicalFF && g_ffPhysicalFd >= 0) {
         if (!test_effect_support(eff->type)) {
             LOG_FF("[FF] physical device does not support effect type %u\n", eff->type);
@@ -461,10 +459,12 @@ int dummy_erase_ff_effect(int aggregatorKid) {
     return 0;
 }
 
-/* ff_play_effect:
-   If doPlay is true, starts the effect; if false, stops it.
-   For FF_RUMBLE effects on a physical FF device, update_rumble_state() is used.
-*/
+/*---------------------------------------------------------
+ * ff_play_effect:
+ *   If doPlay==1, triggers (or retriggers) the effect.
+ *   If doPlay==0, stops the effect—but for FF_RUMBLE effects on a physical device,
+ *   we check that the effect has run for at least its full duration before stopping.
+ *--------------------------------------------------------*/
 void ff_play_effect(int aggregatorKid, int doPlay) {
     LOG_FF("[FF] ff_play_effect: aggregatorKid=%d, doPlay=%d\n", aggregatorKid, doPlay);
     struct AggregatorEffect* slot = aggregatorFindSlotByKid(aggregatorKid);
@@ -475,8 +475,16 @@ void ff_play_effect(int aggregatorKid, int doPlay) {
     if (g_hasPhysicalFF && g_ffPhysicalFd >= 0) {
          if (slot->ffType == FF_RUMBLE) {
              if (doPlay) {
-                 /* For rumble effects on physical devices, simply update the state. */
+                 /* On start events, simply update the PWM state. If this is the first start,
+                    slot->startTimeMs was already set in storeUploadedEffect(). */
              } else {
+                 /* For stop events, ensure the effect has run for its full duration */
+                 unsigned long long now = getTimeMs();
+                 if (now - slot->startTimeMs < slot->durationMs) {
+                     LOG_FF("[FF] ff_play_effect: received stop event too early; effect duration not yet elapsed (elapsed=%llu ms, duration=%u ms); ignoring stop\n",
+                            now - slot->startTimeMs, slot->durationMs);
+                     return;
+                 }
                  aggregatorClearSlot(slot);
              }
              update_rumble_state();
@@ -512,7 +520,10 @@ void ff_play_effect(int aggregatorKid, int doPlay) {
     }
 }
 
-/* aggregatorReuploadAllEffects: Reupload all aggregator effects to the physical FF device */
+/*---------------------------------------------------------
+ * aggregatorReuploadAllEffects:
+ *   Reupload all aggregator effects to the physical FF device.
+ *--------------------------------------------------------*/
 void aggregatorReuploadAllEffects(void) {
     if (!g_hasPhysicalFF || g_ffPhysicalFd < 0) {
         fprintf(stderr, "[FF] aggregatorReuploadAllEffects: no real FF device; skipping.\n");
