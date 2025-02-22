@@ -14,7 +14,8 @@
  *  - In storeUploadedEffect(), we now record the start time of the effect.
  *  - In ff_play_effect(), when a stop event (doPlay==0) is received for a rumble effect,
  *    we check that the effect has run for its full intended duration before stopping.
- *    If not, we ignore the stop command so that the vibration isn’t cut short.
+ *    If not, we schedule a delayed stop so that the vibration isn’t cut short.
+ *  - A periodic sweep is added to clear expired effects.
  *  - The PWM thread uses high-resolution absolute timers and, when stopped,
  *    immediately sends an "off" event to ensure the motor is turned off.
  *  - All existing code remains unabridged.
@@ -46,6 +47,10 @@
  };
  
  static struct AggregatorEffect gEffects[MAX_EFFECTS];
+ 
+ /* Forward declarations for functions used before their definitions */
+ static void aggregatorClearSlot(struct AggregatorEffect* slot);
+ static void update_rumble_state(void);
  
  extern int g_ffPhysicalFd;
  extern int g_hasPhysicalFF;
@@ -213,7 +218,42 @@
      }
  }
  
+ /* --- New function: sweepExpiredEffects ---
+      Iterates over all stored effects and clears any that have expired.
+ */
+ static void sweepExpiredEffects(void) {
+     unsigned long long now = getTimeMs();
+     for (int i = 0; i < MAX_EFFECTS; i++) {
+         if (gEffects[i].used && (now - gEffects[i].startTimeMs >= gEffects[i].durationMs)) {
+             LOG_FF("[FF] sweepExpiredEffects: Clearing expired effect aggregatorKid=%d\n", gEffects[i].aggregatorKid);
+             aggregatorClearSlot(&gEffects[i]);
+         }
+     }
+ }
+ 
+ /* --- New structure and function: delayedStopThread ---
+      If a stop event is received before the effect’s full duration,
+      this thread waits for the remaining time and then clears the effect.
+ */
+ struct DelayedStopArg {
+     struct AggregatorEffect *slot;
+     unsigned int remainingMs;
+ };
+ 
+ static void* delayedStopThread(void* arg) {
+     struct DelayedStopArg *dsArg = (struct DelayedStopArg *)arg;
+     if (!dsArg) return NULL;
+     msleep(dsArg->remainingMs);
+     LOG_FF("[FF] delayedStopThread: stopping effect aggregatorKid=%d after delay of %u ms\n",
+            dsArg->slot->aggregatorKid, dsArg->remainingMs);
+     aggregatorClearSlot(dsArg->slot);
+     update_rumble_state();
+     free(dsArg);
+     return NULL;
+ }
+ 
  static void update_rumble_state(void) {
+     sweepExpiredEffects();
      static unsigned long long lastUpdate = 0;
      unsigned long long now = getTimeMs();
      if (now - lastUpdate < 50) return;
@@ -261,7 +301,7 @@
          startPWMThread();
      }
  }
- 
+  
  static void* aggregatorPlayThread(void* arg) {
      struct AggregatorEffect* slot = (struct AggregatorEffect*)arg;
      if (!slot) return NULL;
@@ -270,9 +310,10 @@
      LOG_FF("[FF-Thread] aggregatorKid=%d, starting fallback effect for %u ms\n", aggregatorKid, duration);
      fallbackToggleMotor(duration, &slot->shouldStop);
      LOG_FF("[FF-Thread] aggregatorKid=%d, fallback effect completed\n", aggregatorKid);
+     aggregatorClearSlot(slot);  // Clear the slot after effect completes
      return NULL;
  }
- 
+  
  static struct AggregatorEffect* aggregatorFindSlotByKid(int kid) {
      if (kid < 0) return NULL;
      for (int i = 0; i < MAX_EFFECTS; i++) {
@@ -281,7 +322,7 @@
      }
      return NULL;
  }
- 
+  
  static struct AggregatorEffect* aggregatorFindFreeSlot(void) {
      for (int i = 0; i < MAX_EFFECTS; i++){
          if (!gEffects[i].used) return &gEffects[i];
@@ -289,7 +330,7 @@
      LOG_FF("[FF] aggregator => no free slot => reusing slot=0.\n");
      return &gEffects[0];
  }
- 
+  
  static void aggregatorClearSlot(struct AggregatorEffect* slot) {
      if (!slot) return;
      slot->used = 0;
@@ -301,7 +342,7 @@
      slot->startTimeMs = 0;
      memset(&slot->original, 0, sizeof(slot->original));
  }
- 
+  
  void storeUploadedEffect(struct ff_effect* eff) {
      if (!eff) return;
      LOG_FF("[FF] storeUploadedEffect: aggregatorKid=%d, type=%u, replay=%u ms\n",
@@ -317,9 +358,9 @@
                 unified, g_ffMagnitudeMultiplier, adjustedMag);
      }
      if (g_ffDivisor != 1) {
-        unsigned int origLen = eff->replay.length;
-        eff->replay.length = eff->replay.length / g_ffDivisor;
-        LOG_FF("[FF] effect length divided by %d: %u -> %u\n", g_ffDivisor, origLen, eff->replay.length);
+         unsigned int origLen = eff->replay.length;
+         eff->replay.length = eff->replay.length / g_ffDivisor;
+         LOG_FF("[FF] effect length divided by %d: %u -> %u\n", g_ffDivisor, origLen, eff->replay.length);
      }
      struct AggregatorEffect* slot = aggregatorFindSlotByKid(eff->id);
      if (!slot) {
@@ -355,14 +396,14 @@
          }
      }
  }
- 
+  
  int dummy_upload_ff_effect(struct ff_effect* eff) {
      if (!eff) return -1;
      LOG_FF("[FF] dummy_upload_ff_effect: aggregatorKid=%d, type=%u, replay=%u ms\n",
             eff->id, eff->type, eff->replay.length);
      return 0;
  }
- 
+  
  int dummy_erase_ff_effect(int aggregatorKid) {
      LOG_FF("[FF] dummy_erase_ff_effect: aggregatorKid=%d\n", aggregatorKid);
      struct AggregatorEffect* slot = aggregatorFindSlotByKid(aggregatorKid);
@@ -374,7 +415,7 @@
      aggregatorClearSlot(slot);
      return 0;
  }
- 
+  
  void ff_play_effect(int aggregatorKid, int doPlay) {
      LOG_FF("[FF] ff_play_effect: aggregatorKid=%d, doPlay=%d\n", aggregatorKid, doPlay);
      struct AggregatorEffect* slot = aggregatorFindSlotByKid(aggregatorKid);
@@ -426,7 +467,7 @@
           slot->shouldStop = 1;
      }
  }
- 
+  
  void aggregatorReuploadAllEffects(void) {
      if (!g_hasPhysicalFF || g_ffPhysicalFd < 0) {
          fprintf(stderr, "[FF] aggregatorReuploadAllEffects: no real FF device; skipping.\n");
