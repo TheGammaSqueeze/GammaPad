@@ -16,7 +16,8 @@ SRCS = gammapad_main.c \
        gammapad_inputdefs.c \
        gammapad_ff.c \
        gammapad_commands.c \
-       gammapad_capture.c
+       gammapad_capture.c \
+       gammapad_config.c
 
 OBJS = $(SRCS:.c=.o)
 
