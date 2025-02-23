@@ -15,7 +15,10 @@
  *  - In ff_play_effect(), when a stop event (doPlay==0) is received for a rumble effect,
  *    we check that the effect has run for its full intended duration before stopping.
  *    If not, we schedule a delayed stop so that the vibration isn’t cut short.
- *  - A periodic sweep is added to clear expired effects.
+ *  - A periodic resynchronization thread is added to:
+ *       a) sweep expired effects,
+ *       b) reassert the desired state, and
+ *       c) acquire an exclusive grab (via EVIOCGRAB) only while an effect is active.
  *  - The PWM thread uses high-resolution absolute timers and, when stopped,
  *    immediately sends an "off" event to ensure the motor is turned off.
  *  - All existing code remains unabridged.
@@ -48,9 +51,10 @@
  
  static struct AggregatorEffect gEffects[MAX_EFFECTS];
  
- /* Forward declarations for functions used before their definitions */
+ /* Forward declaration for aggregatorClearSlot */
  static void aggregatorClearSlot(struct AggregatorEffect* slot);
- static void update_rumble_state(void);
+ 
+ /* --- Existing code begins --- */
  
  extern int g_ffPhysicalFd;
  extern int g_hasPhysicalFF;
@@ -231,34 +235,16 @@
      }
  }
  
- /* --- New structure and function: delayedStopThread ---
-      If a stop event is received before the effect’s full duration,
-      this thread waits for the remaining time and then clears the effect.
+ /* --- New: Define update_rumble_state ---
+      This function sweeps expired effects and updates the PWM or direct FF state.
  */
- struct DelayedStopArg {
-     struct AggregatorEffect *slot;
-     unsigned int remainingMs;
- };
- 
- static void* delayedStopThread(void* arg) {
-     struct DelayedStopArg *dsArg = (struct DelayedStopArg *)arg;
-     if (!dsArg) return NULL;
-     msleep(dsArg->remainingMs);
-     LOG_FF("[FF] delayedStopThread: stopping effect aggregatorKid=%d after delay of %u ms\n",
-            dsArg->slot->aggregatorKid, dsArg->remainingMs);
-     aggregatorClearSlot(dsArg->slot);
-     update_rumble_state();
-     free(dsArg);
-     return NULL;
- }
- 
  static void update_rumble_state(void) {
      sweepExpiredEffects();
      static unsigned long long lastUpdate = 0;
      unsigned long long now = getTimeMs();
      if (now - lastUpdate < 50) return;
      lastUpdate = now;
- 
+  
      unsigned int maxMag = 0;
      int effectId = -1;
      int found = 0;
@@ -301,7 +287,89 @@
          startPWMThread();
      }
  }
-  
+ 
+ /* --- New structure and function: delayedStopThread ---
+      If a stop event is received before the effect’s full duration,
+      this thread waits for the remaining time and then clears the effect.
+ */
+ struct DelayedStopArg {
+     struct AggregatorEffect *slot;
+     unsigned int remainingMs;
+ };
+ 
+ static void* delayedStopThread(void* arg) {
+     struct DelayedStopArg *dsArg = (struct DelayedStopArg *)arg;
+     if (!dsArg) return NULL;
+     msleep(dsArg->remainingMs);
+     LOG_FF("[FF] delayedStopThread: stopping effect aggregatorKid=%d after delay of %u ms\n",
+            dsArg->slot->aggregatorKid, dsArg->remainingMs);
+     aggregatorClearSlot(dsArg->slot);
+     update_rumble_state();
+     free(dsArg);
+     return NULL;
+ }
+ 
+ /* --- New: Periodic Resync Thread ---
+      This thread periodically re-synchronizes the physical FF device state.
+      It also ensures that an exclusive EVIOCGRAB is held only while an effect is active.
+ */
+ static pthread_t ffResyncThread;
+ static volatile int ffResyncThreadShouldStop = 0;
+ static int ffGrabbed = 0;
+ 
+ static void* ff_resync_thread(void* arg) {
+     (void)arg;
+     while (!ffResyncThreadShouldStop) {
+          update_rumble_state();  // Also sweeps expired effects.
+          int active = 0;
+          for (int i = 0; i < MAX_EFFECTS; i++) {
+              if (gEffects[i].used) {
+                  active = 1;
+                  break;
+              }
+          }
+          if (g_ffPhysicalFd >= 0) {
+              if (active && !ffGrabbed) {
+                  if (ioctl(g_ffPhysicalFd, EVIOCGRAB, 1) == 0) {
+                       ffGrabbed = 1;
+                       LOG_FF("[FF] ff_resync_thread: Exclusive grab acquired\n");
+                  } else {
+                       LOG_FF("[FF] ff_resync_thread: Failed to acquire grab: %s\n", strerror(errno));
+                  }
+              } else if (!active && ffGrabbed) {
+                  if (ioctl(g_ffPhysicalFd, EVIOCGRAB, 0) == 0) {
+                       ffGrabbed = 0;
+                       LOG_FF("[FF] ff_resync_thread: Exclusive grab released\n");
+                       struct input_event ev;
+                       memset(&ev, 0, sizeof(ev));
+                       ev.type = EV_FF;
+                       ev.code = 0; // fallback code; adjust as needed
+                       ev.value = 0;
+                       write(g_ffPhysicalFd, &ev, sizeof(ev));
+                  } else {
+                       LOG_FF("[FF] ff_resync_thread: Failed to release grab: %s\n", strerror(errno));
+                  }
+              }
+          }
+          msleep(100);  // Resync every 100 ms.
+     }
+     return NULL;
+ }
+ 
+ /* Start the resync thread automatically */
+ __attribute__((constructor))
+ static void ff_resync_init(void) {
+     pthread_create(&ffResyncThread, NULL, ff_resync_thread, NULL);
+ }
+ 
+ /* Stop the resync thread on unload */
+ __attribute__((destructor))
+ static void ff_resync_deinit(void) {
+     ffResyncThreadShouldStop = 1;
+     pthread_join(ffResyncThread, NULL);
+ }
+ 
+ /* --- Existing aggregatorPlayThread and aggregator helper functions --- */
  static void* aggregatorPlayThread(void* arg) {
      struct AggregatorEffect* slot = (struct AggregatorEffect*)arg;
      if (!slot) return NULL;
