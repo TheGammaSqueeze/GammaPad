@@ -48,6 +48,9 @@ static inline unsigned long long getTimeMs(void)
     return (unsigned long long)tv.tv_sec * 1000ULL + (tv.tv_usec / 1000ULL);
 }
 
+/* Map a physical FF effect ID back to the original aggregatorKid */
+int getAggregatorKidForRealDevId(int realDevId);
+
 /*
  * Extern: controllerFd is defined in gammapad_main.c
  */

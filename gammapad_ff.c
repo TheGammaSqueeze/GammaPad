@@ -239,6 +239,9 @@
       This function sweeps expired effects and updates the PWM or direct FF state.
  */
  static void update_rumble_state(void) {
+     // if we don't yet have a real FF device, nothing to do
+     if (!g_hasPhysicalFF || g_ffPhysicalFd < 0)
+         return;
      sweepExpiredEffects();
      static unsigned long long lastUpdate = 0;
      unsigned long long now = getTimeMs();
@@ -565,3 +568,18 @@
      }
  }
  
+ /**
+ * getAggregatorKidForRealDevId
+ *
+ * Given a realDevId coming from the kernel, return the
+ * original aggregatorKid so that ff_play_effect() can
+ * find the proper slot.
+ */
+int getAggregatorKidForRealDevId(int realDevId) {
+    for (int i = 0; i < MAX_EFFECTS; i++) {
+        if (gEffects[i].used && gEffects[i].realDevId == realDevId) {
+            return gEffects[i].aggregatorKid;
+        }
+    }
+    return -1;
+}

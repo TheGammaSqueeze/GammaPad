@@ -289,9 +289,17 @@
          if(n == 0) break;
          if((size_t)n < sizeof(ev)) break;
          
-         if(ev.type == EV_FF){
-             if(controllerFd >= 0){
-                 write(controllerFd, &ev, sizeof(ev));
+         if (ev.type == EV_FF) {
+             if (controllerFd >= 0) {
+                 // remap realDevId -> aggregatorKid
+                 extern int getAggregatorKidForRealDevId(int realDevId);
+                 int aggId = getAggregatorKidForRealDevId(ev.code);
+                 if (aggId >= 0) {
+                   struct input_event out = ev;
+                     out.code = aggId;
+                     write(controllerFd, &out, sizeof(out));
+                 }
+                 // else: ignore hardware-only events
              }
          }
      }

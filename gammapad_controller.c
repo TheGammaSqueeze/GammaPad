@@ -117,6 +117,7 @@ int create_virtual_controller(int* fd_out)
     ioctl(fd, UI_SET_EVBIT, EV_KEY);
     ioctl(fd, UI_SET_EVBIT, EV_ABS);
     ioctl(fd, UI_SET_PROPBIT, INPUT_PROP_DIRECT);
+    ioctl(fd, UI_SET_EVBIT, EV_UINPUT);
     /* Enable force feedback events */
     ioctl(fd, UI_SET_EVBIT, EV_FF);
 
