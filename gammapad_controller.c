@@ -115,10 +115,41 @@ int create_virtual_controller(int* fd_out) {
     ioctl(fd, UI_SET_EVBIT, EV_KEY);
     ioctl(fd, UI_SET_EVBIT, EV_ABS);
     ioctl(fd, UI_SET_PROPBIT, INPUT_PROP_DIRECT);
+    ioctl(fd, UI_SET_EVBIT, EV_UINPUT);
+    /* Enable force feedback events */
     ioctl(fd, UI_SET_EVBIT, EV_FF);
 
-    /* FF mirroring or defaults… */
+    extern int g_ffPhysicalFd;
+    extern int g_hasPhysicalFF;
+    if (g_hasPhysicalFF && g_ffPhysicalFd >= 0) {
+        /* Query the physical device for supported FF effect bits */
+        unsigned long ffBits[2] = {0};
+        if (ioctl(g_ffPhysicalFd, EVIOCGBIT(EV_FF, sizeof(ffBits)), ffBits) < 0) {
+            LOG_FF("create_virtual_controller: EVIOCGBIT on physical FF device failed: %s\n", strerror(errno));
+            /* Fall back to a minimal set (e.g., FF_RUMBLE only) */
+            ioctl(fd, UI_SET_FFBIT, FF_RUMBLE);
+        } else {
+            /* Iterate over a reasonable range (e.g., 0 to 127) and enable only supported bits */
+            for (unsigned int i = 0; i < 128; i++) {
+                if (ffBits[i / (8 * sizeof(unsigned long))] & (1UL << (i % (8 * sizeof(unsigned long))))) {
+                    ioctl(fd, UI_SET_FFBIT, i);
+                    LOG_FF("create_virtual_controller: enabling FF effect %u\n", i);
+                }
+            }
+        }
+    } else {
+        /* No physical FF device: enable a default set */
+        ioctl(fd, UI_SET_FFBIT, FF_RUMBLE);
+        ioctl(fd, UI_SET_FFBIT, FF_PERIODIC);
+        ioctl(fd, UI_SET_FFBIT, FF_CONSTANT);
+        ioctl(fd, UI_SET_FFBIT, FF_GAIN);
+        ioctl(fd, UI_SET_FFBIT, FF_RAMP);
+        ioctl(fd, UI_SET_FFBIT, FF_SPRING);
+        ioctl(fd, UI_SET_FFBIT, FF_DAMPER);
+        ioctl(fd, UI_SET_FFBIT, FF_INERTIA);
+    }
 
+    /* Enable keys and axes based on discovered scancodes */
     enableDiscoveredKeys(fd);
     enableDiscoveredAxes(fd);
 
