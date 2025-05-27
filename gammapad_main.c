@@ -107,6 +107,9 @@ int g_analog_sensitivity = 0;
 /* emulate GAS/BRAKE from buttons L2/R2 */
 int g_gas_brake_emulation  = 0;
 
+/* configurable deadzone percentage (0…100) */
+int g_deadzone = 0;
+
  /*
   * function prototypes...
   */

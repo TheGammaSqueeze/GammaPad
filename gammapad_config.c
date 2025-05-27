@@ -25,6 +25,8 @@ extern int g_ffPwmMaxMagnitude;
 
 extern void triggerCalibration(void);
 
+extern int g_deadzone;
+
 /* NEW: Declare aggregatorReuploadAllEffects() from gammapad_ff.c */
 extern void aggregatorReuploadAllEffects(void);
 
@@ -372,6 +374,31 @@ static void load_initial_config(void) {
         }
     }
     pthread_mutex_unlock(&config_mutex);
+
+    /* DEADZONE: integer 0..100 */
+    snprintf(filepath, sizeof(filepath), "%s/%s", CONFIG_DIR, "DEADZONE");
+    f = fopen(filepath, "r");
+    pthread_mutex_lock(&config_mutex);
+    if (f) {
+        if (fgets(buf, sizeof(buf), f)) {
+            int v = atoi(buf);
+            if (v < 0) v = 0;
+            if (v > 100) v = 100;
+            g_deadzone = v;
+            fprintf(stderr, "Loaded persistent DEADZONE: %d%%\n", g_deadzone);
+        }
+        fclose(f);
+    } else {
+        f = fopen(filepath, "w");
+        if (f) {
+            fprintf(f, "%d\n", g_deadzone);
+            fclose(f);
+            fprintf(stderr, "Created persistent DEADZONE file with value: %d%%\n", g_deadzone);
+        } else {
+            perror("fopen DEADZONE for writing");
+        }
+    }
+    pthread_mutex_unlock(&config_mutex);
 }
 
 /* update_parameter():
@@ -501,6 +528,13 @@ static void update_parameter(const char *filename, const char *new_value) {
             fprintf(stderr, "[Config] Calibration mode triggered\n");
             triggerCalibration();
         }
+    }
+    else if (strcmp(filename, "DEADZONE") == 0) {
+        int v = atoi(new_value);
+        if (v < 0) v = 0;
+        if (v > 100) v = 100;
+        g_deadzone = v;
+        fprintf(stderr, "Updated DEADZONE to %d%%\n", g_deadzone);
     }
 
     pthread_mutex_unlock(&config_mutex);

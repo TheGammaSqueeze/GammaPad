@@ -91,6 +91,10 @@ extern int g_analog_sensitivity;
 /* Emulate GAS/BRAKE from L2/R2 if physical axes missing */
 extern int g_gas_brake_emulation;
 
+/* Configurable deadzone percentage (0…100).  
+   Values within ±(deadzone% of half-range) around center will be treated as center. */
+extern int g_deadzone;
+
 /*
  * New virtual controller parameters (set via command-line):
  */

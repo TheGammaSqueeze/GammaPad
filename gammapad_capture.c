@@ -82,6 +82,9 @@ int getPhysicalAbsMax(int scancode)
     return g_physicalAbsMax[scancode];
 }
 
+/* Circular deadzone support: track last processed ABS values */
+static int last_processed_abs[ABS_MAX+1] = {0};
+
 /*****************************************************************************
  * readLinkFully => "readlink -f <somePath>"
  ****************************************************************************/
@@ -810,6 +813,29 @@ void forward_physical_event(const struct input_event* ev)
             }
         }
 
+        /* 2.5) Circular deadzone (sticks only: ABS_X, ABS_Y, ABS_RX, ABS_RY) */
+        if ((sc == ABS_X || sc == ABS_Y || sc == ABS_RX || sc == ABS_RY) && g_deadzone > 0) {
+            int mn     = getPhysicalAbsMin(sc);
+            int mx     = getPhysicalAbsMax(sc);
+            int center = (mn + mx) / 2;
+            int half   = (mx - mn) / 2;
+            int dz     = (half * g_deadzone) / 100;
+
+            /* pick the other axis in the same stick */
+            int other_sc = (sc == ABS_X ? ABS_Y
+                          : sc == ABS_Y ? ABS_X
+                          : sc == ABS_RX ? ABS_RY
+                          :                ABS_RX);
+            int other_val = last_processed_abs[other_sc];
+
+            int dx = ev_val - center;
+            int dy = other_val - center;
+            /* if inside the circle, snap both axes to center */
+            if ((dx*dx + dy*dy) <= dz*dz) {
+                ev_val = center;
+            }
+        }
+
         /* 3) DPAD ↔ Left-Stick swap */
         if (g_dpad_analog_swap) {
             int hatx = g_absMap[ABS_HAT0X];
@@ -886,6 +912,9 @@ void forward_physical_event(const struct input_event* ev)
         out[1].code  = SYN_REPORT;
         out[1].value = 0;
         write(controllerFd, out, sizeof(out));
+
+        /* 5) Record for next deadzone calc */
+        last_processed_abs[sc] = ev_val;
     }
 }
 
