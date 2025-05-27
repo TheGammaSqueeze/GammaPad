@@ -344,6 +344,32 @@ static void load_initial_config(void) {
         }
     }
     pthread_mutex_unlock(&config_mutex);
+
+    /* ANALOGSENSITIVITY: integer -3..3 */
+    snprintf(filepath, sizeof(filepath), "%s/%s", CONFIG_DIR, "ANALOGSENSITIVITY");
+    f = fopen(filepath, "r");
+    pthread_mutex_lock(&config_mutex);
+    if (f) {
+        if (fgets(buf, sizeof(buf), f)) {
+            int v = atoi(buf);
+            if (v < -3) v = -3;
+            if (v >  3) v =  3;
+            g_analog_sensitivity = v;
+            fprintf(stderr, "Loaded persistent ANALOGSENSITIVITY: %d\n", g_analog_sensitivity);
+        }
+        fclose(f);
+    } else {
+        f = fopen(filepath, "w");
+        if (f) {
+            fprintf(f, "%d\n", g_analog_sensitivity);
+            fclose(f);
+            fprintf(stderr, "Created ANALOGSENSITIVITY file with default %d\n",
+                    g_analog_sensitivity);
+        } else {
+            perror("fopen ANALOGSENSITIVITY for writing");
+        }
+    }
+    pthread_mutex_unlock(&config_mutex);
 }
 
 /* update_parameter():
@@ -459,6 +485,13 @@ static void update_parameter(const char *filename, const char *new_value) {
     else if (strcmp(filename, "RIGHTSTICKINVERT") == 0) {
         g_right_stick_invert = (atoi(new_value) != 0);
         fprintf(stderr, "Updated RIGHTSTICKINVERT to %d\n", g_right_stick_invert);
+    }
+    else if (strcmp(filename, "ANALOGSENSITIVITY") == 0) {
+        int v = atoi(new_value);
+        if (v < -3) v = -3;
+        if (v >  3) v =  3;
+        g_analog_sensitivity = v;
+        fprintf(stderr, "Updated ANALOGSENSITIVITY to %d\n", g_analog_sensitivity);
     }
 
     pthread_mutex_unlock(&config_mutex);

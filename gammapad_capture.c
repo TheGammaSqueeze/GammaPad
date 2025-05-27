@@ -714,11 +714,11 @@ void forward_physical_event(const struct input_event* ev)
     if (!ev || controllerFd < 0) return;
 
     if (ev->type == EV_KEY) {
-        int sc = ev->code;
+        int sc     = ev->code;
         if (sc < 0 || sc > KEY_MAX) return;
         int mapped = g_keyMap[sc];
 
-        // ABXY swap
+        /* ABXY swap */
         if (g_abxy_layout) {
             if      (mapped == BTN_A) mapped = BTN_B;
             else if (mapped == BTN_B) mapped = BTN_A;
@@ -726,17 +726,16 @@ void forward_physical_event(const struct input_event* ev)
             else if (mapped == BTN_Y) mapped = BTN_X;
         }
 
-        fprintf(stderr,"[FWD] KEY sc=%d => final=%d => val=%d\n",
+        fprintf(stderr,
+                "[FWD] KEY sc=%d => final=%d => val=%d\n",
                 sc, mapped, ev->value);
 
-        struct input_event out[2];
-        memset(out, 0, sizeof(out));
+        struct input_event out[2] = {};
         out[0].type  = EV_KEY;
         out[0].code  = mapped;
         out[0].value = ev->value;
         out[1].type  = EV_SYN;
         out[1].code  = SYN_REPORT;
-        out[1].value = 0;
         write(controllerFd, out, sizeof(out));
         return;
     }
@@ -744,20 +743,48 @@ void forward_physical_event(const struct input_event* ev)
         int sc = ev->code;
         if (sc < 0 || sc > ABS_MAX) return;
 
-        // 1) Apply inversion to ev_val
+        /* 1) Inversion */
         int ev_val = ev->value;
         if ((sc == ABS_X || sc == ABS_Y) && g_left_stick_invert) {
             int mn = getPhysicalAbsMin(sc);
             int mx = getPhysicalAbsMax(sc);
             ev_val = mn + mx - ev_val;
         }
-        else if ((sc == ABS_RX || sc == ABS_RY) && g_right_stick_invert) {
+        else if ((sc == ABS_RX || sc == ABS_RY)
+                 && g_right_stick_invert)
+        {
             int mn = getPhysicalAbsMin(sc);
             int mx = getPhysicalAbsMax(sc);
             ev_val = mn + mx - ev_val;
         }
 
-        // 2) DPAD ↔ Left-Stick swap (if enabled)
+        /* 2) Sensitivity scaling (sticks only: X, Y, RX, RY) */
+        if (sc == ABS_X  || sc == ABS_Y  ||
+            sc == ABS_RX || sc == ABS_RY)
+        {
+            int sens = g_analog_sensitivity;
+            if (sens != 0) {
+                int mn     = getPhysicalAbsMin(sc);
+                int mx     = getPhysicalAbsMax(sc);
+                int center = (mn + mx) / 2;
+                int delta  = ev_val - center;
+                int num = 100;
+                switch (sens) {
+                    case -3: num =  50; break;  // 50%
+                    case -2: num =  75; break;  // 75%
+                    case -1: num =  90; break;  // 90%
+                    case  1: num = 110; break;  // 110%
+                    case  2: num = 125; break;  // 125%
+                    case  3: num = 150; break;  // 150%
+                }
+                delta  = (delta * num) / 100;
+                ev_val = center + delta;
+                if (ev_val < mn) ev_val = mn;
+                if (ev_val > mx) ev_val = mx;
+            }
+        }
+
+        /* 3) DPAD ↔ Left-Stick swap */
         if (g_dpad_analog_swap) {
             int hatx_map = g_absMap[ABS_HAT0X];
             int haty_map = g_absMap[ABS_HAT0Y];
@@ -765,7 +792,7 @@ void forward_physical_event(const struct input_event* ev)
             int lsy_map  = g_absMap[ABS_Y];
 
             if (hatx_map >= 0 && haty_map >= 0 && lsx_map >= 0 && lsy_map >= 0) {
-                // DPAD → Analog
+                /* DPAD → Analog */
                 if (sc == ABS_HAT0X || sc == ABS_HAT0Y) {
                     int physMin, physMax, physCenter, mapped;
                     if (sc == ABS_HAT0X) {
@@ -779,8 +806,7 @@ void forward_physical_event(const struct input_event* ev)
                     }
                     physCenter = (physMin + physMax) / 2;
 
-                    struct input_event out[2];
-                    memset(out, 0, sizeof(out));
+                    struct input_event out[2] = {};
                     out[0].type  = EV_ABS;
                     out[0].code  = mapped;
                     if      (ev_val < 0) out[0].value = physMin;
@@ -788,11 +814,10 @@ void forward_physical_event(const struct input_event* ev)
                     else                 out[0].value = physCenter;
                     out[1].type  = EV_SYN;
                     out[1].code  = SYN_REPORT;
-                    out[1].value = 0;
                     write(controllerFd, out, sizeof(out));
                     return;
                 }
-                // Analog → DPAD
+                /* Analog → DPAD */
                 if (sc == ABS_X || sc == ABS_Y) {
                     int physMin    = getPhysicalAbsMin(sc);
                     int physMax    = getPhysicalAbsMax(sc);
@@ -806,35 +831,31 @@ void forward_physical_event(const struct input_event* ev)
                     else if (delta < -thresh) hatVal = -1;
 
                     int mapped = (sc == ABS_X ? hatx_map : haty_map);
-
-                    struct input_event out[2];
-                    memset(out, 0, sizeof(out));
+                    struct input_event out[2] = {};
                     out[0].type  = EV_ABS;
                     out[0].code  = mapped;
                     out[0].value = hatVal;
                     out[1].type  = EV_SYN;
                     out[1].code  = SYN_REPORT;
-                    out[1].value = 0;
                     write(controllerFd, out, sizeof(out));
                     return;
                 }
             }
         }
 
-        // 3) Normal ABS mapping (swap disabled or axes missing)
+        /* 4) Normal ABS mapping */
         int mapped = g_absMap[sc];
-        fprintf(stderr,"[FWD] ABS sc=%d => final=%d => val=%d\n",
+        fprintf(stderr,
+                "[FWD] ABS sc=%d => final=%d => val=%d\n",
                 sc, mapped, ev_val);
         if (mapped < 0) return;
 
-        struct input_event out[2];
-        memset(out, 0, sizeof(out));
+        struct input_event out[2] = {};
         out[0].type  = EV_ABS;
         out[0].code  = mapped;
         out[0].value = ev_val;
         out[1].type  = EV_SYN;
         out[1].code  = SYN_REPORT;
-        out[1].value = 0;
         write(controllerFd, out, sizeof(out));
     }
 }

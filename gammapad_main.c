@@ -101,6 +101,9 @@ int g_dpad_analog_swap = 0;
 int g_left_stick_invert  = 0;
 int g_right_stick_invert = 0;
 
+/* analog sensitivity (-3…+3) */
+int g_analog_sensitivity = 0;
+
  /*
   * function prototypes...
   */
