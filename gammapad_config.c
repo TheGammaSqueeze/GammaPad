@@ -23,6 +23,8 @@ extern int g_uiversion;
 extern int g_ffPwmEnabled;
 extern int g_ffPwmMaxMagnitude;
 
+extern void triggerCalibration(void);
+
 /* NEW: Declare aggregatorReuploadAllEffects() from gammapad_ff.c */
 extern void aggregatorReuploadAllEffects(void);
 
@@ -492,6 +494,13 @@ static void update_parameter(const char *filename, const char *new_value) {
         if (v >  3) v =  3;
         g_analog_sensitivity = v;
         fprintf(stderr, "Updated ANALOGSENSITIVITY to %d\n", g_analog_sensitivity);
+    }
+    else if (strcmp(filename, "CALIBRATION_MODE") == 0) {
+        int mode = atoi(new_value);
+        if (mode == 1) {
+            fprintf(stderr, "[Config] Calibration mode triggered\n");
+            triggerCalibration();
+        }
     }
 
     pthread_mutex_unlock(&config_mutex);

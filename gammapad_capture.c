@@ -16,6 +16,7 @@
  *****************************************************/
 
 #include "gammapad_capture.h"
+#include "gammapad_calibration.h"
 #include <sys/epoll.h>
 #include <linux/input.h>
 #include <errno.h>
@@ -765,6 +766,10 @@ void forward_physical_event(const struct input_event* ev)
     else if (ev->type == EV_ABS) {
         int sc = ev->code;
         if (sc < 0 || sc > ABS_MAX) return;
+
+        /* 0) Record raw value and apply calibration *before* any inversion/sensitivity */
+        recordRawValue(sc, ev->value);
+        int ev_val = applyCalibration(sc, ev->value);
 
         /* 1) Inversion */
         int ev_val = ev->value;
