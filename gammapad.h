@@ -73,6 +73,9 @@ extern float g_ffMagnitudeMultiplier;
 extern int g_ffPwmEnabled;
 extern int g_ffPwmMaxMagnitude;
 
+/* ABXY swap layout: 0 = off, 1 = swap A<->B, X<->Y */
+extern int g_abxy_layout;
+
 /*
  * New virtual controller parameters (set via command-line):
  */

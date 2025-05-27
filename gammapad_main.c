@@ -91,6 +91,9 @@
  int g_ffPwmEnabled = 0;
  int g_ffPwmMaxMagnitude = 32767;
  
+/* ABXY swap layout: 0 = off, 1 = swap A<->B, X<->Y */
+int g_abxy_layout = 0;
+
  /*
   * function prototypes...
   */

@@ -253,6 +253,29 @@ static void load_initial_config(void) {
         }
     }
     pthread_mutex_unlock(&config_mutex);
+
+    /* ABXY_LAYOUT: integer 0 or 1 */
+    snprintf(filepath, sizeof(filepath), "%s/%s", CONFIG_DIR, "ABXY_LAYOUT");
+    f = fopen(filepath, "r");
+    pthread_mutex_lock(&config_mutex);
+    if (f) {
+        if (fgets(buf, sizeof(buf), f)) {
+            int value = atoi(buf);
+            g_abxy_layout = (value != 0);
+            fprintf(stderr, "Loaded persistent ABXY_LAYOUT: %d\n", g_abxy_layout);
+        }
+        fclose(f);
+    } else {
+        f = fopen(filepath, "w");
+        if (f) {
+            fprintf(f, "%d\n", g_abxy_layout);
+            fclose(f);
+            fprintf(stderr, "Created persistent ABXY_LAYOUT file with value: %d\n", g_abxy_layout);
+        } else {
+            perror("fopen ABXY_LAYOUT for writing");
+        }
+    }
+    pthread_mutex_unlock(&config_mutex);
 }
 
 /* update_parameter():
@@ -350,6 +373,11 @@ static void update_parameter(const char *filename, const char *new_value) {
                 aggregatorReuploadAllEffects();
             }
         }
+    }
+    else if (strcmp(filename, "ABXY_LAYOUT") == 0) {
+        int enable = atoi(new_value) != 0;
+        g_abxy_layout = enable;
+        fprintf(stderr, "Updated ABXY_LAYOUT to %d\n", g_abxy_layout);
     }
     pthread_mutex_unlock(&config_mutex);
 }

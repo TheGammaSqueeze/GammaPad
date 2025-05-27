@@ -718,6 +718,15 @@ void forward_physical_event(const struct input_event* ev)
         int sc= ev->code;
         if(sc<0||sc>KEY_MAX) return;
         int mapped= g_keyMap[sc];
+
+        // If swap-layout is enabled, swap A<->B, X<->Y
+        if (g_abxy_layout) {
+            if (mapped == BTN_A)      mapped = BTN_B;
+            else if (mapped == BTN_B) mapped = BTN_A;
+            else if (mapped == BTN_X) mapped = BTN_Y;
+            else if (mapped == BTN_Y) mapped = BTN_X;
+        }
+
         fprintf(stderr,"[FWD] KEY sc=%d => final=%d => val=%d\n",
                 sc,mapped,ev->value);
 
