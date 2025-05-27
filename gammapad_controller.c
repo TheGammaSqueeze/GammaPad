@@ -103,72 +103,27 @@ static void enableDiscoveredAxes(int fd)
  * FF effects via EVIOCGBIT and enable exactly those bits on the virtual
  * controller so that it reflects the physical motor.
  */
-int create_virtual_controller(int* fd_out)
-{
-    if (!fd_out)
-        return -1;
-
-    int fd = open("/dev/uinput", O_RDWR | O_NONBLOCK);
-    if (fd < 0){
+int create_virtual_controller(int* fd_out) {
+    if (!fd_out) return -1;
+    int fd = open("/dev/uinput", O_RDWR|O_NONBLOCK);
+    if (fd < 0) {
         LOG_FF("create_virtual_controller: open => %s\n", strerror(errno));
         return -1;
     }
 
+    /* Core bits */
     ioctl(fd, UI_SET_EVBIT, EV_KEY);
     ioctl(fd, UI_SET_EVBIT, EV_ABS);
     ioctl(fd, UI_SET_PROPBIT, INPUT_PROP_DIRECT);
-    ioctl(fd, UI_SET_EVBIT, EV_UINPUT);
-    /* Enable force feedback events */
     ioctl(fd, UI_SET_EVBIT, EV_FF);
 
-    extern int g_ffPhysicalFd;
-    extern int g_hasPhysicalFF;
-    if (g_hasPhysicalFF && g_ffPhysicalFd >= 0) {
-        /* Query the physical device for supported FF effect bits */
-        unsigned long ffBits[2] = {0};
-        if (ioctl(g_ffPhysicalFd, EVIOCGBIT(EV_FF, sizeof(ffBits)), ffBits) < 0) {
-            LOG_FF("create_virtual_controller: EVIOCGBIT on physical FF device failed: %s\n", strerror(errno));
-            /* Fall back to a minimal set (e.g., FF_RUMBLE only) */
-            ioctl(fd, UI_SET_FFBIT, FF_RUMBLE);
-        } else {
-            /* Iterate over a reasonable range (e.g., 0 to 127) and enable only supported bits */
-            for (unsigned int i = 0; i < 128; i++) {
-                if (ffBits[i / (8 * sizeof(unsigned long))] & (1UL << (i % (8 * sizeof(unsigned long))))) {
-                    ioctl(fd, UI_SET_FFBIT, i);
-                    LOG_FF("create_virtual_controller: enabling FF effect %u\n", i);
-                }
-            }
-        }
-    } else {
-        /* No physical FF device: enable a default set */
-        ioctl(fd, UI_SET_FFBIT, FF_RUMBLE);
-        ioctl(fd, UI_SET_FFBIT, FF_PERIODIC);
-        ioctl(fd, UI_SET_FFBIT, FF_CONSTANT);
-        ioctl(fd, UI_SET_FFBIT, FF_GAIN);
-        ioctl(fd, UI_SET_FFBIT, FF_RAMP);
-        ioctl(fd, UI_SET_FFBIT, FF_SPRING);
-        ioctl(fd, UI_SET_FFBIT, FF_DAMPER);
-        ioctl(fd, UI_SET_FFBIT, FF_INERTIA);
-    }
+    /* FF mirroring or defaults… */
 
-    /* Enable keys and axes based on discovered scancodes */
     enableDiscoveredKeys(fd);
     enableDiscoveredAxes(fd);
 
-    /* GAS/BRAKE emulation: always advertise those axes (0–1 range) */
-    if (g_gas_brake_emulation) {
-        ioctl(fd, UI_SET_ABSBIT, ABS_GAS);
-        ioctl(fd, UI_SET_ABSBIT, ABS_BRAKE);
-        uidev.absmin[ABS_GAS]  = 0;
-        uidev.absmax[ABS_GAS]  = 1;
-        uidev.absmin[ABS_BRAKE]= 0;
-        uidev.absmax[ABS_BRAKE]= 1;
-        fprintf(stderr, "Virtual controller: emulated ABS_GAS/ABS_BRAKE [0..1]\n");
-    }
-
     struct uinput_user_dev uidev;
     memset(&uidev, 0, sizeof(uidev));
-
     snprintf(uidev.name, UINPUT_MAX_NAME_SIZE, "%s", g_uiname);
     uidev.id.bustype = g_uibus;
     uidev.id.vendor  = g_uivid;
@@ -176,41 +131,57 @@ int create_virtual_controller(int* fd_out)
     uidev.id.version = g_uiversion;
     uidev.ff_effects_max = 32;
 
-    /* Set fallback ranges for typical axes if not discovered */
-    setAbsRange(&uidev, ABS_X,  -1800, 1800);
-    setAbsRange(&uidev, ABS_Y,  -1800, 1800);
-    setAbsRange(&uidev, ABS_Z,  -1800, 1800);
-    setAbsRange(&uidev, ABS_RZ, -1800, 1800);
-    setAbsRange(&uidev, ABS_GAS,    0, 255);
-    setAbsRange(&uidev, ABS_BRAKE,  0, 255);
-    setAbsRange(&uidev, ABS_HAT0X, -1, 1);
-    setAbsRange(&uidev, ABS_HAT0Y, -1, 1);
+    /* GAS/BRAKE emulation: always advertise ABS_BRAKE (sc 2) & ABS_GAS (sc 5) */
+    if (g_gas_brake_emulation) {
+        ioctl(fd, UI_SET_ABSBIT, ABS_BRAKE);
+        ioctl(fd, UI_SET_ABSBIT, ABS_GAS);
 
-    /* Override fallback values with discovered physical min/max */
-    for (int sc = 0; sc <= ABS_MAX; sc++){
-        if (g_discoveredAxes[sc]){
-            int finalAxis = g_absMap[sc];
-            int minVal = getPhysicalAbsMin(sc);
-            int maxVal = getPhysicalAbsMax(sc);
-            LOG_FF("create_virtual_controller: sc=%d => finalAxis=%d => min=%d, max=%d\n",
-                   sc, finalAxis, minVal, maxVal);
-            uidev.absmin[finalAxis] = minVal;
-            uidev.absmax[finalAxis] = maxVal;
+        /* if not discovered, give them a 0..16384 range */
+        if (!g_discoveredAxes[ABS_BRAKE]) {
+            uidev.absmin[ABS_BRAKE] = 0;
+            uidev.absmax[ABS_BRAKE] = 16384;
+        }
+        if (!g_discoveredAxes[ABS_GAS]) {
+            uidev.absmin[ABS_GAS] = 0;
+            uidev.absmax[ABS_GAS] = 16384;
+        }
+        LOG_FF("create_virtual_controller: emulated ABS_BRAKE/ABS_GAS\n");
+    }
+
+    /* fallback ranges */
+    setAbsRange(&uidev, ABS_X,     -1800, 1800);
+    setAbsRange(&uidev, ABS_Y,     -1800, 1800);
+    setAbsRange(&uidev, ABS_Z,     -1800, 1800);
+    setAbsRange(&uidev, ABS_RX,    -1800, 1800);
+    setAbsRange(&uidev, ABS_RY,    -1800, 1800);
+    setAbsRange(&uidev, ABS_BRAKE,     0, 255);
+    setAbsRange(&uidev, ABS_GAS,       0, 255);
+    setAbsRange(&uidev, ABS_HAT0X,    -1,    1);
+    setAbsRange(&uidev, ABS_HAT0Y,    -1,    1);
+
+    /* override with real min/max */
+    for (int sc = 0; sc <= ABS_MAX; sc++) {
+        if (g_discoveredAxes[sc]) {
+            int axis = g_absMap[sc];
+            int mn   = getPhysicalAbsMin(sc);
+            int mx   = getPhysicalAbsMax(sc);
+            uidev.absmin[axis] = mn;
+            uidev.absmax[axis] = mx;
+            LOG_FF("create_virtual_controller: sc=%d→axis=%d→[%d..%d]\n",
+                   sc, axis, mn, mx);
         }
     }
 
-    if (write(fd, &uidev, sizeof(uidev)) < 0){
-        LOG_FF("create_virtual_controller: write => %s\n", strerror(errno));
-        close(fd);
-        return -1;
-    }
-    if (ioctl(fd, UI_DEV_CREATE) < 0){
-        LOG_FF("create_virtual_controller: UI_DEV_CREATE => %s\n", strerror(errno));
+    if (write(fd, &uidev, sizeof(uidev)) < 0 ||
+        ioctl(fd, UI_DEV_CREATE)    < 0)
+    {
+        LOG_FF("create_virtual_controller: UI_DEV_CREATE => %s\n",
+               strerror(errno));
         close(fd);
         return -1;
     }
 
-    LOG_FF("create_virtual_controller: success => fd=%d\n", fd);
+    LOG_FF("create_virtual_controller: success fd=%d\n", fd);
     *fd_out = fd;
     return 0;
 }

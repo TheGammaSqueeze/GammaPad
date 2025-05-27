@@ -720,17 +720,16 @@ void forward_physical_event(const struct input_event* ev)
 
         /* ABXY swap */
         if (g_abxy_layout) {
-            if      (mapped == BTN_A)  mapped = BTN_B;
-            else if (mapped == BTN_B)  mapped = BTN_A;
-            else if (mapped == BTN_X)  mapped = BTN_Y;
-            else if (mapped == BTN_Y)  mapped = BTN_X;
+            if      (mapped == BTN_A) mapped = BTN_B;
+            else if (mapped == BTN_B) mapped = BTN_A;
+            else if (mapped == BTN_X) mapped = BTN_Y;
+            else if (mapped == BTN_Y) mapped = BTN_X;
         }
 
+        /* 1) Forward the KEY event */
         fprintf(stderr,
                 "[FWD] KEY sc=%d => final=%d => val=%d\n",
                 sc, mapped, ev->value);
-
-        /* 1) Forward the KEY event */
         struct input_event outKey[2] = {};
         outKey[0].type  = EV_KEY;
         outKey[0].code  = mapped;
@@ -740,21 +739,20 @@ void forward_physical_event(const struct input_event* ev)
         outKey[1].value = 0;
         write(controllerFd, outKey, sizeof(outKey));
 
-        /* 2) GAS/BRAKE emulation: map L2/R2 presses to ABS_BRAKE/ABS_GAS */
+        /* 2) GAS/BRAKE emulation: L2/R2 keys → ABS_BRAKE/ABS_GAS */
         if (g_gas_brake_emulation) {
-            int axis = -1;
-            if (mapped == BTN_TL2) axis = ABS_BRAKE;
-            else if (mapped == BTN_TR2) axis = ABS_GAS;
-            if (axis >= 0) {
-                /* determine full-scale for this axis */
-                int physMax = getPhysicalAbsMax(axis);
-                int maxv    = (physMax > 0 ? physMax : 1);
-
-                /* emit ABS event at 0 or full */
+            int axisSc   = -1;
+            int axisCode = -1;
+            if (mapped == BTN_TL2)      { axisSc = ABS_BRAKE; axisCode = ABS_BRAKE; }
+            else if (mapped == BTN_TR2) { axisSc = ABS_GAS;   axisCode = ABS_GAS;   }
+            if (axisSc >= 0) {
+                int full = (g_discoveredAxes[axisSc]
+                            ? getPhysicalAbsMax(axisSc)
+                            : 16384);
                 struct input_event outAbs[2] = {};
                 outAbs[0].type  = EV_ABS;
-                outAbs[0].code  = axis;
-                outAbs[0].value = ev->value ? maxv : 0;
+                outAbs[0].code  = axisCode;
+                outAbs[0].value = ev->value ? full : 0;
                 outAbs[1].type  = EV_SYN;
                 outAbs[1].code  = SYN_REPORT;
                 outAbs[1].value = 0;
@@ -771,18 +769,18 @@ void forward_physical_event(const struct input_event* ev)
         /* 1) Inversion */
         int ev_val = ev->value;
         if ((sc == ABS_X || sc == ABS_Y) && g_left_stick_invert) {
-            int mn    = getPhysicalAbsMin(sc);
-            int mx    = getPhysicalAbsMax(sc);
-            ev_val    = mn + mx - ev_val;
+            int mn = getPhysicalAbsMin(sc);
+            int mx = getPhysicalAbsMax(sc);
+            ev_val = mn + mx - ev_val;
         }
         else if ((sc == ABS_RX || sc == ABS_RY) && g_right_stick_invert) {
-            int mn    = getPhysicalAbsMin(sc);
-            int mx    = getPhysicalAbsMax(sc);
-            ev_val    = mn + mx - ev_val;
+            int mn = getPhysicalAbsMin(sc);
+            int mx = getPhysicalAbsMax(sc);
+            ev_val = mn + mx - ev_val;
         }
 
         /* 2) Sensitivity scaling (sticks only: X, Y, RX, RY) */
-        if (sc == ABS_X  || sc == ABS_Y  ||
+        if (sc == ABS_X  || sc == ABS_Y ||
             sc == ABS_RX || sc == ABS_RY)
         {
             int sens = g_analog_sensitivity;
@@ -793,12 +791,12 @@ void forward_physical_event(const struct input_event* ev)
                 int delta  = ev_val - center;
                 int num;
                 switch (sens) {
-                    case -3: num =  50; break;  /*  50% */
-                    case -2: num =  75; break;  /*  75% */
-                    case -1: num =  90; break;  /*  90% */
-                    case  1: num = 110; break;  /* 110% */
-                    case  2: num = 125; break;  /* 125% */
-                    case  3: num = 150; break;  /* 150% */
+                    case -3: num =  50; break;
+                    case -2: num =  75; break;
+                    case -1: num =  90; break;
+                    case  1: num = 110; break;
+                    case  2: num = 125; break;
+                    case  3: num = 150; break;
                     default: num = 100; break;
                 }
                 delta  = (delta * num) / 100;
@@ -810,34 +808,32 @@ void forward_physical_event(const struct input_event* ev)
 
         /* 3) DPAD ↔ Left-Stick swap */
         if (g_dpad_analog_swap) {
-            int hatx_map = g_absMap[ABS_HAT0X];
-            int haty_map = g_absMap[ABS_HAT0Y];
-            int lsx_map  = g_absMap[ABS_X];
-            int lsy_map  = g_absMap[ABS_Y];
+            int hatx = g_absMap[ABS_HAT0X];
+            int haty = g_absMap[ABS_HAT0Y];
+            int lsx  = g_absMap[ABS_X];
+            int lsy  = g_absMap[ABS_Y];
 
-            if (hatx_map >= 0 && haty_map >= 0 &&
-                lsx_map  >= 0 && lsy_map  >= 0) 
-            {
+            if (hatx >= 0 && haty >= 0 && lsx >= 0 && lsy >= 0) {
                 /* DPAD → Analog */
                 if (sc == ABS_HAT0X || sc == ABS_HAT0Y) {
                     int physMin, physMax, physCenter, mapped;
                     if (sc == ABS_HAT0X) {
                         physMin = getPhysicalAbsMin(ABS_X);
                         physMax = getPhysicalAbsMax(ABS_X);
-                        mapped  = lsx_map;
+                        mapped  = lsx;
                     } else {
                         physMin = getPhysicalAbsMin(ABS_Y);
                         physMax = getPhysicalAbsMax(ABS_Y);
-                        mapped  = lsy_map;
+                        mapped  = lsy;
                     }
                     physCenter = (physMin + physMax) / 2;
 
                     struct input_event out[2] = {};
                     out[0].type  = EV_ABS;
                     out[0].code  = mapped;
-                    if      (ev_val < 0) out[0].value = physMin;
-                    else if (ev_val > 0) out[0].value = physMax;
-                    else                 out[0].value = physCenter;
+                    out[0].value = (ev_val < 0 ? physMin
+                                      : ev_val > 0 ? physMax
+                                      : physCenter);
                     out[1].type  = EV_SYN;
                     out[1].code  = SYN_REPORT;
                     out[1].value = 0;
@@ -850,14 +846,14 @@ void forward_physical_event(const struct input_event* ev)
                     int physMax    = getPhysicalAbsMax(sc);
                     int physCenter = (physMin + physMax) / 2;
                     int halfRange  = (physMax - physMin) / 2;
-                    int thresh     = halfRange * 60 / 100;  /* 60% */
+                    int thresh     = halfRange * 60 / 100;
 
                     int delta  = ev_val - physCenter;
-                    int hatVal = 0;
-                    if      (delta >  thresh) hatVal = +1;
-                    else if (delta < -thresh) hatVal = -1;
+                    int hatVal = (delta >  thresh ? +1
+                                   : delta < -thresh ? -1
+                                   : 0);
 
-                    int mapped = (sc == ABS_X ? hatx_map : haty_map);
+                    int mapped = (sc == ABS_X ? hatx : haty);
                     struct input_event out[2] = {};
                     out[0].type  = EV_ABS;
                     out[0].code  = mapped;
