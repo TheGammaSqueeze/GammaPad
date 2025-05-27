@@ -479,28 +479,42 @@ void discoverAxes(int fd)
 #ifdef __ANDROID__
 void parse_android_keylayout_file_if_needed(int fd)
 {
-    fprintf(stderr,"[GammaPadCapture] parse_android_keylayout_file_if_needed => .kl\n");
+    fprintf(stderr, "[GammaPadCapture] parse_android_keylayout_file_if_needed => .kl\n");
     struct input_id id;
-    if(ioctl(fd, EVIOCGID, &id)==0){
-        fprintf(stderr,"[KL] vendor=0x%04x product=0x%04x\n", id.vendor, id.product);
+    if (ioctl(fd, EVIOCGID, &id) == 0) {
+        fprintf(stderr, "[KL] vendor=0x%04x product=0x%04x\n", id.vendor, id.product);
 
+        /* Try both system and vendor partitions */
+        const char* base_dirs[] = {
+            "/system/usr/keylayout",
+            "/vendor/usr/keylayout"
+        };
         char klPath[256];
-        snprintf(klPath,sizeof(klPath),
-                 "/system/usr/keylayout/Vendor_%04x_Product_%04x.kl",
-                 id.vendor, id.product);
+        FILE* f = NULL;
 
-        FILE* f= fopen(klPath,"r");
-        if(!f){
-            /* NO .kl => do nothing, fallback sc => sc. */
-            fprintf(stderr,"[KL] no .kl => %s => skipping.\n", klPath);
+        for (size_t i = 0; i < sizeof(base_dirs)/sizeof(base_dirs[0]); i++) {
+            snprintf(klPath, sizeof(klPath),
+                     "%s/Vendor_%04x_Product_%04x.kl",
+                     base_dirs[i], id.vendor, id.product);
+
+            f = fopen(klPath, "r");
+            if (f) {
+                fprintf(stderr, "[KL] found => %s => parsing lines...\n", klPath);
+                break;
+            } else {
+                fprintf(stderr, "[KL] no .kl => %s => skipping.\n", klPath);
+            }
+        }
+
+        if (!f) {
+            /* None of the paths had a matching .kl */
             return;
         }
-        fprintf(stderr,"[KL] found => %s => parsing lines...\n", klPath);
 
         char line[256];
-        while(fgets(line,sizeof(line),f)){
-            char*nl=strchr(line,'\n');
-            if(nl)*nl=0;
+        while (fgets(line, sizeof(line), f)) {
+            char* nl = strchr(line, '\n');
+            if (nl) *nl = '\0';
             parseKeyLayoutLine(line);
         }
         fclose(f);
