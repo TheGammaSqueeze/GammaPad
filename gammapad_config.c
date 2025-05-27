@@ -276,6 +276,30 @@ static void load_initial_config(void) {
         }
     }
     pthread_mutex_unlock(&config_mutex);
+
+    /* DPAD_ANALOG_SWAP: integer 0 or 1 */
+    snprintf(filepath, sizeof(filepath), "%s/%s", CONFIG_DIR, "DPAD_ANALOG_SWAP");
+    f = fopen(filepath, "r");
+    pthread_mutex_lock(&config_mutex);
+    if (f) {
+        if (fgets(buf, sizeof(buf), f)) {
+            int value = atoi(buf);
+            g_dpad_analog_swap = (value != 0);
+            fprintf(stderr, "Loaded persistent DPAD_ANALOG_SWAP: %d\n", g_dpad_analog_swap);
+        }
+        fclose(f);
+    } else {
+        /* create default file */
+        f = fopen(filepath, "w");
+        if (f) {
+            fprintf(f, "%d\n", g_dpad_analog_swap);
+            fclose(f);
+            fprintf(stderr, "Created DPAD_ANALOG_SWAP file with default %d\n", g_dpad_analog_swap);
+        } else {
+            perror("fopen DPAD_ANALOG_SWAP for writing");
+        }
+    }
+    pthread_mutex_unlock(&config_mutex);
 }
 
 /* update_parameter():
@@ -378,6 +402,11 @@ static void update_parameter(const char *filename, const char *new_value) {
         int enable = atoi(new_value) != 0;
         g_abxy_layout = enable;
         fprintf(stderr, "Updated ABXY_LAYOUT to %d\n", g_abxy_layout);
+    }
+    else if (strcmp(filename, "DPAD_ANALOG_SWAP") == 0) {
+        int enable = atoi(new_value) != 0;
+        g_dpad_analog_swap = enable;
+        fprintf(stderr, "Updated DPAD_ANALOG_SWAP to %d\n", g_dpad_analog_swap);
     }
     pthread_mutex_unlock(&config_mutex);
 }

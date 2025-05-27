@@ -76,6 +76,9 @@ extern int g_ffPwmMaxMagnitude;
 /* ABXY swap layout: 0 = off, 1 = swap A<->B, X<->Y */
 extern int g_abxy_layout;
 
+/* DPAD/Left-Stick swap: 0 = off, 1 = swap HAT0<->LS */
+extern int g_dpad_analog_swap;
+
 /*
  * New virtual controller parameters (set via command-line):
  */

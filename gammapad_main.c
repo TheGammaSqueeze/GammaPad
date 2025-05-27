@@ -94,6 +94,9 @@
 /* ABXY swap layout: 0 = off, 1 = swap A<->B, X<->Y */
 int g_abxy_layout = 0;
 
+/* DPAD/Left-Stick swap: 0 = off, 1 = swap HAT0<->LS */
+int g_dpad_analog_swap = 0;
+
  /*
   * function prototypes...
   */

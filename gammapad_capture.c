@@ -743,6 +743,80 @@ void forward_physical_event(const struct input_event* ev)
     else if(ev->type==EV_ABS){
         int sc= ev->code;
         if(sc<0||sc>ABS_MAX) return;
+
+        /* DPAD <-> Left-Stick swap */
+        if (g_dpad_analog_swap) {
+            /* gather mapped indices for the four axes */
+            int hatx_map = g_absMap[ABS_HAT0X];
+            int haty_map = g_absMap[ABS_HAT0Y];
+            int lsx_map  = g_absMap[ABS_X];
+            int lsy_map  = g_absMap[ABS_Y];
+
+            /* only proceed if all four exist */
+            if (hatx_map >= 0 && haty_map >= 0 && 
+                lsx_map  >= 0 && lsy_map  >= 0) 
+            {
+                /* --- DPAD → Analog --- */
+                if (sc == ABS_HAT0X || sc == ABS_HAT0Y) {
+                    /* pick the corresponding physical axis range */
+                    int physMin, physMax, physCenter, mapped;
+                    if (sc == ABS_HAT0X) {
+                        physMin    = getPhysicalAbsMin(ABS_X);
+                        physMax    = getPhysicalAbsMax(ABS_X);
+                        mapped     = lsx_map;
+                    } else {
+                        physMin    = getPhysicalAbsMin(ABS_Y);
+                        physMax    = getPhysicalAbsMax(ABS_Y);
+                        mapped     = lsy_map;
+                    }
+                    physCenter = (physMin + physMax) / 2;
+
+                    struct input_event out[2];
+                    memset(out, 0, sizeof(out));
+                    out[0].type  = EV_ABS;
+                    out[0].code  = mapped;
+                    /* map −1 → physMin, 0 → center, +1 → physMax */
+                    if      (ev->value < 0) out[0].value = physMin;
+                    else if (ev->value > 0) out[0].value = physMax;
+                    else                     out[0].value = physCenter;
+                    out[1].type  = EV_SYN;
+                    out[1].code  = SYN_REPORT;
+                    out[1].value = 0;
+                    write(controllerFd, out, sizeof(out));
+                    return;
+                }
+
+                /* --- Analog → DPAD --- */
+                if (sc == ABS_X || sc == ABS_Y) {
+                    /* dynamic half-range & threshold */
+                    int physMin    = getPhysicalAbsMin(sc);
+                    int physMax    = getPhysicalAbsMax(sc);
+                    int physCenter = (physMin + physMax) / 2;
+                    int halfRange  = (physMax - physMin) / 2;
+                    int thresh     = halfRange * 60 / 100;  /* 60% */
+
+                    int delta = ev->value - physCenter;
+                    int hatVal = 0;
+                    if      (delta >  thresh) hatVal = +1;
+                    else if (delta < -thresh) hatVal = -1;
+
+                    int mapped = (sc == ABS_X ? hatx_map : haty_map);
+
+                    struct input_event out[2];
+                    memset(out, 0, sizeof(out));
+                    out[0].type  = EV_ABS;
+                    out[0].code  = mapped;
+                    out[0].value = hatVal;
+                    out[1].type  = EV_SYN;
+                    out[1].code  = SYN_REPORT;
+                    out[1].value = 0;
+                    write(controllerFd, out, sizeof(out));
+                    return;
+                }
+                /* other axes fall through to normal mapping */
+            }
+        }
+
         int mapped= g_absMap[sc];
         fprintf(stderr,"[FWD] ABS sc=%d => final=%d => val=%d\n",
                 sc,mapped,ev->value);
