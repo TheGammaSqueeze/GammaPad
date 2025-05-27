@@ -104,6 +104,9 @@ int g_right_stick_invert = 0;
 /* analog sensitivity (-3…+3) */
 int g_analog_sensitivity = 0;
 
+/* emulate GAS/BRAKE from buttons L2/R2 */
+int g_gas_brake_emulation  = 0;
+
  /*
   * function prototypes...
   */
@@ -515,6 +518,9 @@ int g_analog_sensitivity = 0;
      for (int i = 1; i < argc; i++) {
          if (!strncmp(argv[i], "--ffdev=", 8)) {
              g_ffArg = argv[i] + 8;
+         }  else if (!strcmp(argv[i], "--gasbrakeemulation")) {
+            g_gas_brake_emulation = 1;
+            fprintf(stderr, "CLI: GAS/BRAKE emulation enabled\n");
          } else if (!strncmp(argv[i], "--ffdiv=", 8)) {
              g_ffDivisor = atoi(argv[i] + 8);
              if (g_ffDivisor <= 0) g_ffDivisor = 1;

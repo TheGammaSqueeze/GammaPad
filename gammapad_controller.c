@@ -155,6 +155,17 @@ int create_virtual_controller(int* fd_out)
     enableDiscoveredKeys(fd);
     enableDiscoveredAxes(fd);
 
+    /* GAS/BRAKE emulation: always advertise those axes (0–1 range) */
+    if (g_gas_brake_emulation) {
+        ioctl(fd, UI_SET_ABSBIT, ABS_GAS);
+        ioctl(fd, UI_SET_ABSBIT, ABS_BRAKE);
+        uidev.absmin[ABS_GAS]  = 0;
+        uidev.absmax[ABS_GAS]  = 1;
+        uidev.absmin[ABS_BRAKE]= 0;
+        uidev.absmax[ABS_BRAKE]= 1;
+        fprintf(stderr, "Virtual controller: emulated ABS_GAS/ABS_BRAKE [0..1]\n");
+    }
+
     struct uinput_user_dev uidev;
     memset(&uidev, 0, sizeof(uidev));
 

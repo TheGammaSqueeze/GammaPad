@@ -88,6 +88,9 @@ extern int g_right_stick_invert;
 /* Analog sensitivity: -3…0…+3 (–50%,–25%,–10%,0,+10%,+25%,+50%) */
 extern int g_analog_sensitivity;
 
+/* Emulate GAS/BRAKE from L2/R2 if physical axes missing */
+extern int g_gas_brake_emulation;
+
 /*
  * New virtual controller parameters (set via command-line):
  */

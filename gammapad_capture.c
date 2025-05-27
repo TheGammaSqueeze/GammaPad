@@ -720,23 +720,48 @@ void forward_physical_event(const struct input_event* ev)
 
         /* ABXY swap */
         if (g_abxy_layout) {
-            if      (mapped == BTN_A) mapped = BTN_B;
-            else if (mapped == BTN_B) mapped = BTN_A;
-            else if (mapped == BTN_X) mapped = BTN_Y;
-            else if (mapped == BTN_Y) mapped = BTN_X;
+            if      (mapped == BTN_A)  mapped = BTN_B;
+            else if (mapped == BTN_B)  mapped = BTN_A;
+            else if (mapped == BTN_X)  mapped = BTN_Y;
+            else if (mapped == BTN_Y)  mapped = BTN_X;
         }
 
         fprintf(stderr,
                 "[FWD] KEY sc=%d => final=%d => val=%d\n",
                 sc, mapped, ev->value);
 
-        struct input_event out[2] = {};
-        out[0].type  = EV_KEY;
-        out[0].code  = mapped;
-        out[0].value = ev->value;
-        out[1].type  = EV_SYN;
-        out[1].code  = SYN_REPORT;
-        write(controllerFd, out, sizeof(out));
+        /* 1) Forward the KEY event */
+        struct input_event outKey[2] = {};
+        outKey[0].type  = EV_KEY;
+        outKey[0].code  = mapped;
+        outKey[0].value = ev->value;
+        outKey[1].type  = EV_SYN;
+        outKey[1].code  = SYN_REPORT;
+        outKey[1].value = 0;
+        write(controllerFd, outKey, sizeof(outKey));
+
+        /* 2) GAS/BRAKE emulation: map L2/R2 presses to ABS_BRAKE/ABS_GAS */
+        if (g_gas_brake_emulation) {
+            int axis = -1;
+            if (mapped == BTN_TL2) axis = ABS_BRAKE;
+            else if (mapped == BTN_TR2) axis = ABS_GAS;
+            if (axis >= 0) {
+                /* determine full-scale for this axis */
+                int physMax = getPhysicalAbsMax(axis);
+                int maxv    = (physMax > 0 ? physMax : 1);
+
+                /* emit ABS event at 0 or full */
+                struct input_event outAbs[2] = {};
+                outAbs[0].type  = EV_ABS;
+                outAbs[0].code  = axis;
+                outAbs[0].value = ev->value ? maxv : 0;
+                outAbs[1].type  = EV_SYN;
+                outAbs[1].code  = SYN_REPORT;
+                outAbs[1].value = 0;
+                write(controllerFd, outAbs, sizeof(outAbs));
+            }
+        }
+
         return;
     }
     else if (ev->type == EV_ABS) {
@@ -746,16 +771,14 @@ void forward_physical_event(const struct input_event* ev)
         /* 1) Inversion */
         int ev_val = ev->value;
         if ((sc == ABS_X || sc == ABS_Y) && g_left_stick_invert) {
-            int mn = getPhysicalAbsMin(sc);
-            int mx = getPhysicalAbsMax(sc);
-            ev_val = mn + mx - ev_val;
+            int mn    = getPhysicalAbsMin(sc);
+            int mx    = getPhysicalAbsMax(sc);
+            ev_val    = mn + mx - ev_val;
         }
-        else if ((sc == ABS_RX || sc == ABS_RY)
-                 && g_right_stick_invert)
-        {
-            int mn = getPhysicalAbsMin(sc);
-            int mx = getPhysicalAbsMax(sc);
-            ev_val = mn + mx - ev_val;
+        else if ((sc == ABS_RX || sc == ABS_RY) && g_right_stick_invert) {
+            int mn    = getPhysicalAbsMin(sc);
+            int mx    = getPhysicalAbsMax(sc);
+            ev_val    = mn + mx - ev_val;
         }
 
         /* 2) Sensitivity scaling (sticks only: X, Y, RX, RY) */
@@ -768,14 +791,15 @@ void forward_physical_event(const struct input_event* ev)
                 int mx     = getPhysicalAbsMax(sc);
                 int center = (mn + mx) / 2;
                 int delta  = ev_val - center;
-                int num = 100;
+                int num;
                 switch (sens) {
-                    case -3: num =  50; break;  // 50%
-                    case -2: num =  75; break;  // 75%
-                    case -1: num =  90; break;  // 90%
-                    case  1: num = 110; break;  // 110%
-                    case  2: num = 125; break;  // 125%
-                    case  3: num = 150; break;  // 150%
+                    case -3: num =  50; break;  /*  50% */
+                    case -2: num =  75; break;  /*  75% */
+                    case -1: num =  90; break;  /*  90% */
+                    case  1: num = 110; break;  /* 110% */
+                    case  2: num = 125; break;  /* 125% */
+                    case  3: num = 150; break;  /* 150% */
+                    default: num = 100; break;
                 }
                 delta  = (delta * num) / 100;
                 ev_val = center + delta;
@@ -791,7 +815,9 @@ void forward_physical_event(const struct input_event* ev)
             int lsx_map  = g_absMap[ABS_X];
             int lsy_map  = g_absMap[ABS_Y];
 
-            if (hatx_map >= 0 && haty_map >= 0 && lsx_map >= 0 && lsy_map >= 0) {
+            if (hatx_map >= 0 && haty_map >= 0 &&
+                lsx_map  >= 0 && lsy_map  >= 0) 
+            {
                 /* DPAD → Analog */
                 if (sc == ABS_HAT0X || sc == ABS_HAT0Y) {
                     int physMin, physMax, physCenter, mapped;
@@ -814,6 +840,7 @@ void forward_physical_event(const struct input_event* ev)
                     else                 out[0].value = physCenter;
                     out[1].type  = EV_SYN;
                     out[1].code  = SYN_REPORT;
+                    out[1].value = 0;
                     write(controllerFd, out, sizeof(out));
                     return;
                 }
@@ -823,7 +850,7 @@ void forward_physical_event(const struct input_event* ev)
                     int physMax    = getPhysicalAbsMax(sc);
                     int physCenter = (physMin + physMax) / 2;
                     int halfRange  = (physMax - physMin) / 2;
-                    int thresh     = halfRange * 60 / 100;  // 60%
+                    int thresh     = halfRange * 60 / 100;  /* 60% */
 
                     int delta  = ev_val - physCenter;
                     int hatVal = 0;
@@ -837,6 +864,7 @@ void forward_physical_event(const struct input_event* ev)
                     out[0].value = hatVal;
                     out[1].type  = EV_SYN;
                     out[1].code  = SYN_REPORT;
+                    out[1].value = 0;
                     write(controllerFd, out, sizeof(out));
                     return;
                 }
@@ -856,6 +884,7 @@ void forward_physical_event(const struct input_event* ev)
         out[0].value = ev_val;
         out[1].type  = EV_SYN;
         out[1].code  = SYN_REPORT;
+        out[1].value = 0;
         write(controllerFd, out, sizeof(out));
     }
 }
