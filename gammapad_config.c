@@ -1,3 +1,5 @@
+#include "gammapad_config.h"
+#include "gammapad.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -7,7 +9,14 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <errno.h>
-#include "gammapad.h"
+#include <ctype.h>
+#include <linux/input.h>
+#include <sys/stat.h>
+#include "input-event-codes.h"
+#include <sys/ioctl.h>
+#include <sys/epoll.h>
+#include <fcntl.h>
+#include <stdbool.h>
 
 /* External globals and functions from your project */
 extern int controllerFd;
@@ -27,6 +36,11 @@ extern void triggerCalibration(void);
 
 extern int g_deadzone;
 
+extern int g_physCount;
+extern int g_physFds[];
+
+extern int g_epfd;
+
 /* NEW: Declare aggregatorReuploadAllEffects() from gammapad_ff.c */
 extern void aggregatorReuploadAllEffects(void);
 
@@ -35,6 +49,142 @@ static pthread_mutex_t config_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 #define CONFIG_DIR "/data/GammaPad"
 #define EVENT_BUF_LEN (1024 * (sizeof(struct inotify_event) + NAME_MAX + 1))
+#define MAPPINGS_FILE "MAPPINGS"
+#define BITS_PER_LONG (sizeof(unsigned long)*8)
+
+/* Custom key-mapping array: -1 = no mapping */
+int g_customKeyMap[KEY_MAX + 1];
+
+/* Helper to (re)initialize mapping to “no mapping” */
+static void init_custom_key_mappings(void) {
+    for (int i = 0; i <= KEY_MAX; i++) {
+        g_customKeyMap[i] = -1;
+    }
+}
+
+/* Auto-generated name→code table. Update via generate_key_name_map.sh */
+static const struct {
+    const char *name;
+    int code;
+} key_name_map[] = {
+#include "key_name_map.inc"
+};
+static const int key_name_map_size =
+    sizeof(key_name_map) / sizeof(key_name_map[0]);
+
+/* Dump every supported key from the source pad into MAPPINGS */
+static void dump_default_mappings(void) {
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/%s", CONFIG_DIR, MAPPINGS_FILE);
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        perror("Creating default MAPPINGS");
+        return;
+    }
+
+    /* Pick the real source pad FD if we have one, else fall back */
+    int srcFd = (g_physCount > 0 ? g_physFds[0] : controllerFd);
+
+    /* Ask the physical device which keys it supports */
+    unsigned long bits[(KEY_MAX + BITS_PER_LONG) / BITS_PER_LONG] = {0};
+    if (ioctl(srcFd, EVIOCGBIT(EV_KEY, sizeof(bits)), bits) < 0) {
+        perror("EVIOCGBIT on source pad");
+        fclose(f);
+        return;
+    }
+
+    for (int code = 0; code <= KEY_MAX; code++) {
+        if (bits[code / BITS_PER_LONG] & (1UL << (code % BITS_PER_LONG))) {
+            const char *nm = NULL;
+            for (int i = 0; i < key_name_map_size; i++) {
+                if (key_name_map[i].code == code) {
+                    nm = key_name_map[i].name;
+                    break;
+                }
+            }
+            if (nm) {
+                fprintf(f, "%s %s\n", nm, nm);
+            } else {
+                fprintf(f, "%d %d\n", code, code);
+            }
+        }
+    }
+
+    fclose(f);
+    fprintf(stderr, "[Config] Created default MAPPINGS dump from fd=%d\n", srcFd);
+}
+
+// After load_custom_key_mappings()
+static void apply_custom_key_capabilities(int fd) {
+    for (int sc = 0; sc <= KEY_MAX; sc++) {
+        int dst = g_customKeyMap[sc];
+        if (dst >= 0) {
+            ioctl(fd, UI_SET_KEYBIT, dst);
+        }
+    }
+}
+
+/* Parse one token: either decimal/0x number or a name from key_name_map */
+static int parse_key_token(const char *tok) {
+    if (isdigit((unsigned char)tok[0])) {
+        long v = strtol(tok, NULL, 0);
+        return (v >= 0 && v <= KEY_MAX) ? (int)v : -1;
+    } else {
+        for (int i = 0; i < key_name_map_size; i++) {
+            if (strcmp(tok, key_name_map[i].name) == 0)
+                return key_name_map[i].code;
+        }
+        return -1;
+    }
+}
+
+/* Load MAPPINGS into g_customKeyMap[], logging errors */
+static void load_custom_key_mappings(void) {
+    init_custom_key_mappings();
+
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/%s", CONFIG_DIR, MAPPINGS_FILE);
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+
+    char line[256];
+    int lineno = 0;
+    while (fgets(line, sizeof(line), f)) {
+        lineno++;
+        char *p = line;
+        while (isspace((unsigned char)*p)) p++;
+        if (*p == '#' || *p == '\0') continue;
+
+        char *src = p;
+        char *sp = strpbrk(src, " \t");
+        if (!sp) {
+            fprintf(stderr,
+                    "[Config] %s:%d missing separator\n",
+                    MAPPINGS_FILE, lineno);
+            continue;
+        }
+        *sp++ = '\0';
+        while (isspace((unsigned char)*sp)) sp++;
+        char *dst = sp;
+        char *e = strpbrk(dst, "\r\n");
+        if (e) *e = '\0';
+
+        int s = parse_key_token(src);
+        int d = parse_key_token(dst);
+        if (s < 0 || d < 0) {
+            fprintf(stderr,
+                    "[Config] %s:%d invalid '%s'→'%s'\n",
+                    MAPPINGS_FILE, lineno, src, dst);
+        } else {
+            g_customKeyMap[s] = d;
+            fprintf(stderr,
+                    "[Config] MAPPINGS: %d(%s) → %d(%s)\n",
+                    s, src, d, dst);
+        }
+    }
+
+    fclose(f);
+}
 
 /* Helper: Recursively create directory (like "mkdir -p") */
 static int mkdir_recursive(const char *dir, mode_t mode) {
@@ -82,7 +232,14 @@ static void load_initial_config(void) {
     } else {
         chmod(CONFIG_DIR, 0777);
     }
-    
+
+    /* If MAPPINGS doesn’t exist, create with defaults */
+    char mp[PATH_MAX];
+    snprintf(mp, sizeof(mp), "%s/%s", CONFIG_DIR, MAPPINGS_FILE);
+    if (access(mp, F_OK) != 0) {
+        dump_default_mappings();
+    }
+
     /* uiname: string */
     snprintf(filepath, sizeof(filepath), "%s/%s", CONFIG_DIR, "uiname");
     f = fopen(filepath, "r");
@@ -399,6 +556,9 @@ static void load_initial_config(void) {
         }
     }
     pthread_mutex_unlock(&config_mutex);
+    
+    /* Finally, load our custom button→key mappings */
+    load_custom_key_mappings();
 }
 
 /* update_parameter():
@@ -536,6 +696,55 @@ static void update_parameter(const char *filename, const char *new_value) {
         g_deadzone = v;
         fprintf(stderr, "Updated DEADZONE to %d%%\n", g_deadzone);
     }
+    else if (strcmp(filename, MAPPINGS_FILE) == 0) {
+        fprintf(stderr, "[Config] MAPPINGS modified; reloading.\n");
+
+        // 1) reload the in-memory map
+        load_custom_key_mappings();
+
+        // 2) figure out if any mapped dst code is *not* on the real pad
+        int srcFd = (g_physCount > 0 ? g_physFds[0] : controllerFd);
+        unsigned long bits[(KEY_MAX + BITS_PER_LONG) / BITS_PER_LONG] = {0};
+        if (ioctl(srcFd, EVIOCGBIT(EV_KEY, sizeof(bits)), bits) < 0) {
+            perror("EVIOCGBIT on source pad");
+        }
+
+        bool needRecreate = false;
+        for (int sc = 0; sc <= KEY_MAX; sc++) {
+            int dst = g_customKeyMap[sc];
+            if (dst >= 0) {
+                // if src pad *doesn't* support dst bit, we must recreate
+                if (!(bits[dst / BITS_PER_LONG] & (1UL << (dst % BITS_PER_LONG)))) {
+                    needRecreate = true;
+                    break;
+                }
+            }
+        }
+
+        if (!needRecreate) {
+            fprintf(stderr, "[Config] No new codes to advertise, skipping controller recreate.\n");
+        } else {
+            int oldFd = controllerFd;
+
+            // 3) destroy & build a fresh uinput device
+            destroy_virtual_device(oldFd);
+            if (create_virtual_controller(&controllerFd) < 0) {
+                fprintf(stderr, "[Config] Failed to recreate virtual controller after remap\n");
+            } else {
+                fprintf(stderr, "[Config] Recreated virtual controller with updated mappings\n");
+                aggregatorReuploadAllEffects();
+
+                // 4) rewire the epoll watcher so we keep servicing the new FD (so FF still works!)
+                struct epoll_event ev;
+                memset(&ev, 0, sizeof(ev));
+                ev.events = EPOLLIN | EPOLLET;
+                ev.data.fd = controllerFd;
+                epoll_ctl(g_epfd, EPOLL_CTL_DEL, oldFd, NULL);
+                epoll_ctl(g_epfd, EPOLL_CTL_ADD, controllerFd, &ev);
+                fcntl(controllerFd, F_SETFL, O_NONBLOCK);
+            }
+        }
+    }
 
     pthread_mutex_unlock(&config_mutex);
 }
@@ -567,31 +776,31 @@ void *config_watcher_thread(void *arg) {
     char buffer[EVENT_BUF_LEN];
     while (1) {
         int length = read(inotify_fd, buffer, EVENT_BUF_LEN);
-        if (length < 0) {
-            perror("inotify read");
-            break;
-        }
+        if (length < 0) break;
         int i = 0;
         while (i < length) {
-            struct inotify_event *event = (struct inotify_event *)&buffer[i];
-            if (event->len) {
-                if (event->mask & (IN_CREATE | IN_MODIFY)) {
+            struct inotify_event *ev = (struct inotify_event *)&buffer[i];
+            if (ev->len && (ev->mask & (IN_CREATE|IN_MODIFY))) {
+                if (strcmp(ev->name, MAPPINGS_FILE) == 0) {
+                    /* reload all mappings */
+                    update_parameter(ev->name, NULL);
+                } else {
+                    /* existing single-value configs */
                     char filepath[PATH_MAX];
-                    snprintf(filepath, sizeof(filepath), "%s/%s", CONFIG_DIR, event->name);
+                    snprintf(filepath, sizeof(filepath), "%s/%s", CONFIG_DIR, ev->name);
                     FILE *f = fopen(filepath, "r");
                     if (f) {
-                        char new_value[256] = {0};
-                        if (fgets(new_value, sizeof(new_value), f)) {
-                            char *nl = strchr(new_value, '\n');
+                        char newv[256];
+                        if (fgets(newv, sizeof(newv), f)) {
+                            char *nl = strchr(newv,'\n');
                             if (nl) *nl = '\0';
-                            fprintf(stderr, "File %s changed; new value: %s\n", event->name, new_value);
-                            update_parameter(event->name, new_value);
+                            update_parameter(ev->name, newv);
                         }
                         fclose(f);
                     }
                 }
             }
-            i += sizeof(struct inotify_event) + event->len;
+            i += sizeof(struct inotify_event) + ev->len;
         }
     }
     inotify_rm_watch(inotify_fd, wd);

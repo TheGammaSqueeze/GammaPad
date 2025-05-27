@@ -17,6 +17,7 @@
 
 #include "gammapad_capture.h"
 #include "gammapad_calibration.h"
+#include "gammapad_config.h"
 #include <sys/epoll.h>
 #include <linux/input.h>
 #include <errno.h>
@@ -728,6 +729,14 @@ void forward_physical_event(const struct input_event* ev)
             else if (mapped == BTN_B) mapped = BTN_A;
             else if (mapped == BTN_X) mapped = BTN_Y;
             else if (mapped == BTN_Y) mapped = BTN_X;
+        }
+
+        /* Custom user mappings: override if set */
+        if (mapped >= 0 && mapped <= KEY_MAX) {
+            int cm = g_customKeyMap[mapped];
+            if (cm >= 0) {
+                mapped = cm;
+            }
         }
 
         /* 1) Forward the KEY event */

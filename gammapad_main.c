@@ -124,7 +124,7 @@ int g_deadzone = 0;
  
  void parseCommand(const char* line);
  
- static int g_epfd = -1;
+ int g_epfd = -1;
  static void cleanupOnExit(void)
  {
      fprintf(stderr,"[GammaPad] cleanupOnExit => calling unbindAndRebind.\n");
@@ -555,11 +555,6 @@ int g_deadzone = 0;
          }
      }
  
-     /* NEW: Load persistent configuration and start the config watcher.
-        This will override defaults if files exist.
-     */
-     start_config_watcher();
- 
      if (g_ffArg) {
          char* resolvedFF = maybeResolveDevicePath(g_ffArg);
          g_ffPhysicalFd = open_physical_ff_device(resolvedFF);
@@ -581,7 +576,13 @@ int g_deadzone = 0;
              g_physCount++;
          }
      }
- 
+
+    /* NOW that we have our physical pad(s) in g_physFds[0..g_physCount-1],
+       we can safely dump & watch MAPPINGS (dump_default_mappings needs
+       a valid FD to do EVIOCGBIT on). */
+    start_config_watcher();
+
+    /* (Then continue on to create the virtual devices…) */
      if (create_virtual_controller(&controllerFd) < 0) {
          fprintf(stderr, "[GammaPad] create_virtual_controller => fail.\n");
          for (int i = 0; i < g_physCount; i++) {

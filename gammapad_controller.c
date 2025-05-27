@@ -16,6 +16,8 @@
 #include "gammapad_inputdefs.h"
 #include <errno.h>
 #include <string.h>
+#include "input-event-codes.h"   /* for KEY_MAX */
+
 
 /* We'll rely on these externs from gammapad_capture.c */
 extern int g_discoveredKeys[KEY_MAX+1];
@@ -24,6 +26,7 @@ extern int g_keyMap[KEY_MAX+1];
 extern int g_absMap[ABS_MAX+1];
 extern int getPhysicalAbsMin(int scancode);
 extern int getPhysicalAbsMax(int scancode);
+extern int g_customKeyMap[KEY_MAX + 1];
 
 /* We'll read from g_physicalFd if it's open. (legacy leftover) */
 extern int g_physicalFd;
@@ -152,6 +155,14 @@ int create_virtual_controller(int* fd_out) {
     /* Enable keys and axes based on discovered scancodes */
     enableDiscoveredKeys(fd);
     enableDiscoveredAxes(fd);
+
+    /* Advertise every user-mapped destination code */
+    for (int sc = 0; sc <= KEY_MAX; sc++) {
+        int dst = g_customKeyMap[sc];
+        if (dst >= 0) {
+            ioctl(fd, UI_SET_KEYBIT, dst);
+        }
+    }
 
     struct uinput_user_dev uidev;
     memset(&uidev, 0, sizeof(uidev));
