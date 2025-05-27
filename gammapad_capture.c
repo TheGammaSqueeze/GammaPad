@@ -772,7 +772,6 @@ void forward_physical_event(const struct input_event* ev)
         int ev_val = applyCalibration(sc, ev->value);
 
         /* 1) Inversion */
-        int ev_val = ev->value;
         if ((sc == ABS_X || sc == ABS_Y) && g_left_stick_invert) {
             int mn = getPhysicalAbsMin(sc);
             int mx = getPhysicalAbsMax(sc);

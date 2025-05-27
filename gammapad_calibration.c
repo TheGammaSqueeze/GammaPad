@@ -1,4 +1,5 @@
 #include "gammapad_calibration.h"
+#include "gammapad_capture.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

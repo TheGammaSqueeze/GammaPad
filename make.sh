@@ -8,6 +8,7 @@ gammapad_ff.c \
 gammapad_commands.c \
 gammapad_capture.c \
 gammapad_config.c \
+gammapad_calibration.c \
 -o gammapad
 
 
