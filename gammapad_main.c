@@ -97,6 +97,10 @@ int g_abxy_layout = 0;
 /* DPAD/Left-Stick swap: 0 = off, 1 = swap HAT0<->LS */
 int g_dpad_analog_swap = 0;
 
+/* left/right stick inversion flags */
+int g_left_stick_invert  = 0;
+int g_right_stick_invert = 0;
+
  /*
   * function prototypes...
   */

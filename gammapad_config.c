@@ -300,6 +300,50 @@ static void load_initial_config(void) {
         }
     }
     pthread_mutex_unlock(&config_mutex);
+
+    /* LEFTSTICKINVERT: integer 0 or 1 */
+    snprintf(filepath, sizeof(filepath), "%s/%s", CONFIG_DIR, "LEFTSTICKINVERT");
+    f = fopen(filepath, "r");
+    pthread_mutex_lock(&config_mutex);
+    if (f) {
+        if (fgets(buf, sizeof(buf), f)) {
+            g_left_stick_invert = (atoi(buf) != 0);
+            fprintf(stderr, "Loaded persistent LEFTSTICKINVERT: %d\n", g_left_stick_invert);
+        }
+        fclose(f);
+    } else {
+        f = fopen(filepath, "w");
+        if (f) {
+            fprintf(f, "%d\n", g_left_stick_invert);
+            fclose(f);
+            fprintf(stderr, "Created LEFTSTICKINVERT file with value: %d\n", g_left_stick_invert);
+        } else {
+            perror("fopen LEFTSTICKINVERT for writing");
+        }
+    }
+    pthread_mutex_unlock(&config_mutex);
+
+    /* RIGHTSTICKINVERT: integer 0 or 1 */
+    snprintf(filepath, sizeof(filepath), "%s/%s", CONFIG_DIR, "RIGHTSTICKINVERT");
+    f = fopen(filepath, "r");
+    pthread_mutex_lock(&config_mutex);
+    if (f) {
+        if (fgets(buf, sizeof(buf), f)) {
+            g_right_stick_invert = (atoi(buf) != 0);
+            fprintf(stderr, "Loaded persistent RIGHTSTICKINVERT: %d\n", g_right_stick_invert);
+        }
+        fclose(f);
+    } else {
+        f = fopen(filepath, "w");
+        if (f) {
+            fprintf(f, "%d\n", g_right_stick_invert);
+            fclose(f);
+            fprintf(stderr, "Created RIGHTSTICKINVERT file with value: %d\n", g_right_stick_invert);
+        } else {
+            perror("fopen RIGHTSTICKINVERT for writing");
+        }
+    }
+    pthread_mutex_unlock(&config_mutex);
 }
 
 /* update_parameter():
@@ -408,6 +452,15 @@ static void update_parameter(const char *filename, const char *new_value) {
         g_dpad_analog_swap = enable;
         fprintf(stderr, "Updated DPAD_ANALOG_SWAP to %d\n", g_dpad_analog_swap);
     }
+    else if (strcmp(filename, "LEFTSTICKINVERT") == 0) {
+        g_left_stick_invert = (atoi(new_value) != 0);
+        fprintf(stderr, "Updated LEFTSTICKINVERT to %d\n", g_left_stick_invert);
+    }
+    else if (strcmp(filename, "RIGHTSTICKINVERT") == 0) {
+        g_right_stick_invert = (atoi(new_value) != 0);
+        fprintf(stderr, "Updated RIGHTSTICKINVERT to %d\n", g_right_stick_invert);
+    }
+
     pthread_mutex_unlock(&config_mutex);
 }
 
