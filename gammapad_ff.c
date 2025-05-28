@@ -488,56 +488,70 @@
  }
   
  void ff_play_effect(int aggregatorKid, int doPlay) {
-     LOG_FF("[FF] ff_play_effect: aggregatorKid=%d, doPlay=%d\n", aggregatorKid, doPlay);
-     struct AggregatorEffect* slot = aggregatorFindSlotByKid(aggregatorKid);
-     if (!slot || !slot->used) {
-         LOG_FF("[FF] No active rumble effect slot found; ignoring play event\n");
-         return;
-     }
-     if (g_hasPhysicalFF && g_ffPhysicalFd >= 0) {
-          if (slot->ffType == FF_RUMBLE) {
-              if (doPlay) {
-                  /* On start events, update PWM state. */
-              } else {
-                  unsigned long long now = getTimeMs();
-                  if (now - slot->startTimeMs < slot->durationMs) {
-                      LOG_FF("[FF] ff_play_effect: received stop event too early; effect duration not yet elapsed (elapsed=%llu ms, duration=%u ms); ignoring stop\n",
-                             now - slot->startTimeMs, slot->durationMs);
-                      return;
-                  }
-                  aggregatorClearSlot(slot);
-              }
-              update_rumble_state();
-          } else {
-              int effectId = (slot->realDevId >= 0) ? slot->realDevId : aggregatorKid;
-              struct input_event ev;
-              memset(&ev, 0, sizeof(ev));
-              ev.type = EV_FF;
-              ev.code = effectId;
-              ev.value = doPlay;
-              if (write(g_ffPhysicalFd, &ev, sizeof(ev)) < 0) {
-                   LOG_FF("[FF] Direct passthrough write failed: %s\n", strerror(errno));
-              }
-          }
-          return;
-     }
-     if (doPlay) {
-          if (!slot->shouldStop) {
-              slot->shouldStop = 1;
-              msleep(100);
-          }
-          slot->shouldStop = 0;
-          pthread_t th;
-          if (pthread_create(&th, NULL, aggregatorPlayThread, slot) != 0) {
-              LOG_FF("[FF] pthread_create failed: %s\n", strerror(errno));
-          } else {
-              pthread_detach(th);
-              LOG_FF("[FF] spawned play thread for aggregatorKid=%d\n", aggregatorKid);
-          }
-     } else {
-          slot->shouldStop = 1;
-     }
- }
+    LOG_FF("[FF] ff_play_effect: aggregatorKid=%d, doPlay=%d\n", aggregatorKid, doPlay);
+    struct AggregatorEffect* slot = aggregatorFindSlotByKid(aggregatorKid);
+    if (!slot || !slot->used) {
+        LOG_FF("[FF] No active rumble effect slot found; ignoring play event\n");
+        return;
+    }
+
+    /* If we have a physical device, always passthrough rumble immediately. */
+    if (g_hasPhysicalFF && g_ffPhysicalFd >= 0) {
+        int effectId = (slot->realDevId >= 0) ? slot->realDevId : aggregatorKid;
+
+        if (slot->ffType == FF_RUMBLE) {
+            if (doPlay) {
+                /* start/update PWM or direct-on as before */
+                update_rumble_state();
+                LOG_FF("[FF] Starter ping for aggregatorKid=%d\n", aggregatorKid);
+            } else {
+                /* IMMEDIATE STOP — send an “off” and clear slot */
+                LOG_FF("[FF] Immediate stop for aggregatorKid=%d\n", aggregatorKid);
+                struct input_event ev = {0};
+                ev.type  = EV_FF;
+                ev.code  = effectId;
+                ev.value = 0;
+                if (write(g_ffPhysicalFd, &ev, sizeof(ev)) < 0) {
+                    LOG_FF("[FF] ff_play_effect: write off failed: %s\n", strerror(errno));
+                }
+                aggregatorClearSlot(slot);
+            }
+            return;
+        }
+
+        /* Non-rumble effects still passthrough 1:1 */
+        struct input_event ev = {0};
+        ev.type  = EV_FF;
+        ev.code  = effectId;
+        ev.value = doPlay;
+        if (write(g_ffPhysicalFd, &ev, sizeof(ev)) < 0) {
+            LOG_FF("[FF] Direct passthrough write failed: %s\n", strerror(errno));
+        }
+        if (!doPlay) {
+            /* also clear the slot so we won’t resync it later */
+            aggregatorClearSlot(slot);
+        }
+        return;
+    }
+
+    /* FALLBACK: original software-only path */
+    if (doPlay) {
+        if (!slot->shouldStop) {
+            slot->shouldStop = 1;
+            msleep(100);
+        }
+        slot->shouldStop = 0;
+        pthread_t th;
+        if (pthread_create(&th, NULL, aggregatorPlayThread, slot) != 0) {
+            LOG_FF("[FF] pthread_create failed: %s\n", strerror(errno));
+        } else {
+            pthread_detach(th);
+            LOG_FF("[FF] spawned play thread for aggregatorKid=%d\n", aggregatorKid);
+        }
+    } else {
+        slot->shouldStop = 1;
+    }
+}
   
  void aggregatorReuploadAllEffects(void) {
      if (!g_hasPhysicalFF || g_ffPhysicalFd < 0) {
