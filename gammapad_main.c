@@ -26,6 +26,8 @@
  #include <string.h>
  #include <unistd.h>
  #include <pthread.h>
+ #include <limits.h>
+ #include <stdlib.h>
  
  #define MAX_ACTIVE_EVENTS 64
  #define EPOLL_MAX_EVENTS  16
@@ -123,7 +125,12 @@ int g_deadzone = 0;
  void ff_play_effect(int kernel_id, int doPlay);
  
  void parseCommand(const char* line);
- 
+
+ /* where we dump all our config & calibration files: */
+ #ifndef CONFIG_DIR
+ #define CONFIG_DIR "/data/GammaPad"
+ #endif
+
  int g_epfd = -1;
  static void cleanupOnExit(void)
  {
@@ -581,6 +588,13 @@ int g_deadzone = 0;
        we can safely dump & watch MAPPINGS (dump_default_mappings needs
        a valid FD to do EVIOCGBIT on). */
     start_config_watcher();
+
+    {
+        char chmodCmd[PATH_MAX + 32];
+        snprintf(chmodCmd, sizeof(chmodCmd),
+                 "chmod -R 777 %s", CONFIG_DIR);
+        system(chmodCmd);
+    }
 
     /* (Then continue on to create the virtual devices…) */
      if (create_virtual_controller(&controllerFd) < 0) {

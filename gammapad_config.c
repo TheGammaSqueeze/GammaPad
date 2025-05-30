@@ -17,6 +17,8 @@
 #include <sys/epoll.h>
 #include <fcntl.h>
 #include <stdbool.h>
+#include <sys/stat.h> 
+#include <limits.h>
 
 /* External globals and functions from your project */
 extern int controllerFd;
@@ -111,6 +113,7 @@ static void dump_default_mappings(void) {
     }
 
     fclose(f);
+    chmod(path, 0777);
     fprintf(stderr, "[Config] Created default MAPPINGS dump from fd=%d\n", srcFd);
 }
 
@@ -255,6 +258,7 @@ static void load_initial_config(void) {
             fprintf(stderr, "Loaded persistent uiname: %s\n", g_uiname);
         }
         fclose(f);
+        chmod(filepath, 0777);
     } else {
         f = fopen(filepath, "w");
         if (f) {
@@ -280,11 +284,13 @@ static void load_initial_config(void) {
             }
         }
         fclose(f);
+        chmod(filepath, 0777);
     } else {
         f = fopen(filepath, "w");
         if (f) {
             fprintf(f, "%d\n", g_uibus);
             fclose(f);
+            chmod(filepath, 0777);
             fprintf(stderr, "Created persistent uibus file with value: %d\n", g_uibus);
         } else {
             perror("fopen uibus for writing");
@@ -305,11 +311,13 @@ static void load_initial_config(void) {
             }
         }
         fclose(f);
+        chmod(filepath, 0777);
     } else {
         f = fopen(filepath, "w");
         if (f) {
             fprintf(f, "%d\n", g_uivid);
             fclose(f);
+            chmod(filepath, 0777);
             fprintf(stderr, "Created persistent uivid file with value: %d\n", g_uivid);
         } else {
             perror("fopen uivid for writing");
@@ -330,11 +338,13 @@ static void load_initial_config(void) {
             }
         }
         fclose(f);
+        chmod(filepath, 0777);
     } else {
         f = fopen(filepath, "w");
         if (f) {
             fprintf(f, "%d\n", g_uiproduct);
             fclose(f);
+            chmod(filepath, 0777);
             fprintf(stderr, "Created persistent uiproduct file with value: %d\n", g_uiproduct);
         } else {
             perror("fopen uiproduct for writing");
@@ -355,11 +365,13 @@ static void load_initial_config(void) {
             }
         }
         fclose(f);
+        chmod(filepath, 0777);
     } else {
         f = fopen(filepath, "w");
         if (f) {
             fprintf(f, "%d\n", g_uiversion);
             fclose(f);
+            chmod(filepath, 0777);
             fprintf(stderr, "Created persistent uiversion file with value: %d\n", g_uiversion);
         } else {
             perror("fopen uiversion for writing");
@@ -378,11 +390,13 @@ static void load_initial_config(void) {
             fprintf(stderr, "Loaded persistent ffpwm: %d\n", g_ffPwmEnabled);
         }
         fclose(f);
+        chmod(filepath, 0777);
     } else {
         f = fopen(filepath, "w");
         if (f) {
             fprintf(f, "%d\n", g_ffPwmEnabled);
             fclose(f);
+            chmod(filepath, 0777);
             fprintf(stderr, "Created persistent ffpwm file with value: %d\n", g_ffPwmEnabled);
         } else {
             perror("fopen ffpwm for writing");
@@ -403,11 +417,13 @@ static void load_initial_config(void) {
             }
         }
         fclose(f);
+        chmod(filepath, 0777);
     } else {
         f = fopen(filepath, "w");
         if (f) {
             fprintf(f, "%d\n", g_ffPwmMaxMagnitude);
             fclose(f);
+            chmod(filepath, 0777);
             fprintf(stderr, "Created persistent ffpwmmax file with value: %d\n", g_ffPwmMaxMagnitude);
         } else {
             perror("fopen ffpwmmax for writing");
@@ -426,11 +442,13 @@ static void load_initial_config(void) {
             fprintf(stderr, "Loaded persistent ABXY_LAYOUT: %d\n", g_abxy_layout);
         }
         fclose(f);
+        chmod(filepath, 0777);
     } else {
         f = fopen(filepath, "w");
         if (f) {
             fprintf(f, "%d\n", g_abxy_layout);
             fclose(f);
+            chmod(filepath, 0777);
             fprintf(stderr, "Created persistent ABXY_LAYOUT file with value: %d\n", g_abxy_layout);
         } else {
             perror("fopen ABXY_LAYOUT for writing");
@@ -449,12 +467,14 @@ static void load_initial_config(void) {
             fprintf(stderr, "Loaded persistent DPAD_ANALOG_SWAP: %d\n", g_dpad_analog_swap);
         }
         fclose(f);
+        chmod(filepath, 0777);
     } else {
         /* create default file */
         f = fopen(filepath, "w");
         if (f) {
             fprintf(f, "%d\n", g_dpad_analog_swap);
             fclose(f);
+            chmod(filepath, 0777);
             fprintf(stderr, "Created DPAD_ANALOG_SWAP file with default %d\n", g_dpad_analog_swap);
         } else {
             perror("fopen DPAD_ANALOG_SWAP for writing");
@@ -472,11 +492,13 @@ static void load_initial_config(void) {
             fprintf(stderr, "Loaded persistent LEFTSTICKINVERT: %d\n", g_left_stick_invert);
         }
         fclose(f);
+        chmod(filepath, 0777);
     } else {
         f = fopen(filepath, "w");
         if (f) {
             fprintf(f, "%d\n", g_left_stick_invert);
             fclose(f);
+            chmod(filepath, 0777);
             fprintf(stderr, "Created LEFTSTICKINVERT file with value: %d\n", g_left_stick_invert);
         } else {
             perror("fopen LEFTSTICKINVERT for writing");
@@ -494,11 +516,13 @@ static void load_initial_config(void) {
             fprintf(stderr, "Loaded persistent RIGHTSTICKINVERT: %d\n", g_right_stick_invert);
         }
         fclose(f);
+        chmod(filepath, 0777);
     } else {
         f = fopen(filepath, "w");
         if (f) {
             fprintf(f, "%d\n", g_right_stick_invert);
             fclose(f);
+            chmod(filepath, 0777);
             fprintf(stderr, "Created RIGHTSTICKINVERT file with value: %d\n", g_right_stick_invert);
         } else {
             perror("fopen RIGHTSTICKINVERT for writing");
@@ -519,11 +543,13 @@ static void load_initial_config(void) {
             fprintf(stderr, "Loaded persistent ANALOGSENSITIVITY: %d\n", g_analog_sensitivity);
         }
         fclose(f);
+        chmod(filepath, 0777);
     } else {
         f = fopen(filepath, "w");
         if (f) {
             fprintf(f, "%d\n", g_analog_sensitivity);
             fclose(f);
+            chmod(filepath, 0777);
             fprintf(stderr, "Created ANALOGSENSITIVITY file with default %d\n",
                     g_analog_sensitivity);
         } else {
@@ -545,18 +571,39 @@ static void load_initial_config(void) {
             fprintf(stderr, "Loaded persistent DEADZONE: %d%%\n", g_deadzone);
         }
         fclose(f);
+        chmod(filepath, 0777);
     } else {
         f = fopen(filepath, "w");
         if (f) {
             fprintf(f, "%d\n", g_deadzone);
             fclose(f);
+            chmod(filepath, 0777);
             fprintf(stderr, "Created persistent DEADZONE file with value: %d%%\n", g_deadzone);
         } else {
             perror("fopen DEADZONE for writing");
         }
     }
     pthread_mutex_unlock(&config_mutex);
-    
+
+    {
+        const char *files[] = {
+            MAPPINGS_FILE,
+            "uiname", "uibus", "uivid", "uiproduct", "uiversion",
+            "ffpwm", "ffpwmmax",
+            "ABXY_LAYOUT", "DPAD_ANALOG_SWAP",
+            "LEFTSTICKINVERT", "RIGHTSTICKINVERT",
+            "ANALOGSENSITIVITY", "DEADZONE",
+            "CALIBRATION_MODE"
+        };
+        char fp[PATH_MAX];
+        for (size_t i = 0; i < sizeof(files)/sizeof(files[0]); i++) {
+            snprintf(fp, sizeof(fp), "%s/%s", CONFIG_DIR, files[i]);
+            if (access(fp, F_OK) == 0) {
+                chmod(fp, 0777);
+            }
+        }
+    }
+
     /* Finally, load our custom button→key mappings */
     load_custom_key_mappings();
 }

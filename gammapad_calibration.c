@@ -27,6 +27,7 @@ static void ensureConfigDir(void) {
     if (stat(CONFIG_DIR, &st) != 0) {
         mkdir(CONFIG_DIR, 0777);
     }
+    chmod(CONFIG_DIR, 0777);
 }
 
 /* Load saved centers into calibrationOffset[] */
@@ -71,11 +72,14 @@ void triggerCalibration(void) {
         }
     }
     fclose(f);
+    chmod(CALIB_FILE, 0777);
+
     /* reset mode */
     f = fopen(MODE_FILE, "w");
     if (f) {
         fputs("0\n", f);
         fclose(f);
+        chmod(MODE_FILE, 0777);
     }
     fprintf(stderr, "[Calib] Calibration complete — data written to %s\n", CALIB_FILE);
 }
