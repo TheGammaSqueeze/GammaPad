@@ -85,6 +85,9 @@ extern int g_left_stick_invert;
 /* Invert right analog stick: 0 = off, 1 = invert ABS_Z & ABS_RZ */
 extern int g_right_stick_invert;
 
+/* Invert “extra” sticks Z & RZ: 0 = off, 1 = invert ABS_Z & ABS_RZ */
+extern int g_right_stick_invert_z_rz;
+
 /* Analog sensitivity: -3…0…+3 (–50%,–25%,–10%,0,+10%,+25%,+50%) */
 extern int g_analog_sensitivity;
 

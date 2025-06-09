@@ -789,6 +789,11 @@ void forward_physical_event(const struct input_event* ev)
             int mx = getPhysicalAbsMax(sc);
             ev_val = mn + mx - ev_val;
         }
+       else if ((sc == ABS_Z || sc == ABS_RZ) && g_right_stick_invert_z_rz) {
+            int mn = getPhysicalAbsMin(sc);
+            int mx = getPhysicalAbsMax(sc);
+            ev_val = mn + mx - ev_val;
+        }
         else if ((sc == ABS_RX || sc == ABS_RY) && g_right_stick_invert) {
             int mn = getPhysicalAbsMin(sc);
             int mx = getPhysicalAbsMax(sc);
@@ -796,8 +801,10 @@ void forward_physical_event(const struct input_event* ev)
         }
 
         /* 2) Sensitivity scaling (sticks only: X, Y, RX, RY) */
-        if (sc == ABS_X  || sc == ABS_Y ||
-            sc == ABS_RX || sc == ABS_RY)
+        if (sc == ABS_X  || sc == ABS_Y  ||
+            sc == ABS_RX || sc == ABS_RY ||
+            sc == ABS_Z  || sc == ABS_RZ )
+
         {
             int sens = g_analog_sensitivity;
             if (sens != 0) {
@@ -823,27 +830,33 @@ void forward_physical_event(const struct input_event* ev)
         }
 
         /* 2.5) Circular deadzone (sticks only: ABS_X, ABS_Y, ABS_RX, ABS_RY) */
-        if ((sc == ABS_X || sc == ABS_Y || sc == ABS_RX || sc == ABS_RY) && g_deadzone > 0) {
-            int mn     = getPhysicalAbsMin(sc);
-            int mx     = getPhysicalAbsMax(sc);
-            int center = (mn + mx) / 2;
-            int half   = (mx - mn) / 2;
-            int dz     = (half * g_deadzone) / 100;
+       if (g_deadzone > 0 &&
+           (sc == ABS_X  || sc == ABS_Y  ||
+            sc == ABS_RX || sc == ABS_RY ||
+            sc == ABS_Z  || sc == ABS_RZ))
+       {
+           /* circular dead-zone: works on each stick pair */
+           int mn     = getPhysicalAbsMin(sc);
+           int mx     = getPhysicalAbsMax(sc);
+           int center = (mn + mx) / 2;
+           int half   = (mx - mn) / 2;
+           int dz     = (half * g_deadzone) / 100;
 
-            /* pick the other axis in the same stick */
-            int other_sc = (sc == ABS_X ? ABS_Y
-                          : sc == ABS_Y ? ABS_X
-                          : sc == ABS_RX ? ABS_RY
-                          :                ABS_RX);
-            int other_val = last_processed_abs[other_sc];
+           /* pick the “other” axis in the same stick */
+           int other_sc;
+           if      (sc == ABS_X ) other_sc = ABS_Y;
+           else if (sc == ABS_Y ) other_sc = ABS_X;
+           else if (sc == ABS_RX) other_sc = ABS_RY;
+           else if (sc == ABS_RY) other_sc = ABS_RX;
+           else if (sc == ABS_Z ) other_sc = ABS_RZ;
+           else                    other_sc = ABS_Z;   // sc == ABS_RZ
 
-            int dx = ev_val - center;
-            int dy = other_val - center;
-            /* if inside the circle, snap both axes to center */
-            if ((dx*dx + dy*dy) <= dz*dz) {
-                ev_val = center;
-            }
-        }
+           int dx = ev_val - center;
+           int dy = last_processed_abs[other_sc] - center;
+           if ((dx*dx + dy*dy) <= dz*dz) {
+               ev_val = center;
+           }
+       }
 
         /* 3) DPAD ↔ Left-Stick swap */
         if (g_dpad_analog_swap) {

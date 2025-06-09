@@ -530,6 +530,30 @@ static void load_initial_config(void) {
     }
     pthread_mutex_unlock(&config_mutex);
 
+    /* RIGHTSTICKINVERT_Z_RZ: integer 0 or 1 */
+    snprintf(filepath, sizeof(filepath), "%s/%s", CONFIG_DIR, "RIGHTSTICKINVERT_Z_RZ");
+    f = fopen(filepath, "r");
+    pthread_mutex_lock(&config_mutex);
+    if (f) {
+        if (fgets(buf, sizeof(buf), f)) {
+            g_right_stick_invert_z_rz = (atoi(buf) != 0);
+            fprintf(stderr, "Loaded persistent RIGHTSTICKINVERT_Z_RZ: %d\n", g_right_stick_invert_z_rz);
+        }
+        fclose(f);
+        chmod(filepath, 0777);
+    } else {
+        f = fopen(filepath, "w");
+        if (f) {
+            fprintf(f, "%d\n", g_right_stick_invert_z_rz);
+            fclose(f);
+            chmod(filepath, 0777);
+            fprintf(stderr, "Created RIGHTSTICKINVERT_Z_RZ file with default: %d\n", g_right_stick_invert_z_rz);
+        } else {
+            perror("fopen RIGHTSTICKINVERT_Z_RZ for writing");
+        }
+    }
+    pthread_mutex_unlock(&config_mutex);
+
     /* ANALOGSENSITIVITY: integer -3..3 */
     snprintf(filepath, sizeof(filepath), "%s/%s", CONFIG_DIR, "ANALOGSENSITIVITY");
     f = fopen(filepath, "r");
@@ -592,6 +616,7 @@ static void load_initial_config(void) {
             "ffpwm", "ffpwmmax",
             "ABXY_LAYOUT", "DPAD_ANALOG_SWAP",
             "LEFTSTICKINVERT", "RIGHTSTICKINVERT",
+            "RIGHTSTICKINVERT_Z_RZ",
             "ANALOGSENSITIVITY", "DEADZONE",
             "CALIBRATION_MODE"
         };
@@ -721,6 +746,11 @@ static void update_parameter(const char *filename, const char *new_value) {
     else if (strcmp(filename, "RIGHTSTICKINVERT") == 0) {
         g_right_stick_invert = (atoi(new_value) != 0);
         fprintf(stderr, "Updated RIGHTSTICKINVERT to %d\n", g_right_stick_invert);
+    }
+    else if (strcmp(filename, "RIGHTSTICKINVERT_Z_RZ") == 0) {
+        g_right_stick_invert_z_rz = (atoi(new_value) != 0);
+        fprintf(stderr, "Updated RIGHTSTICKINVERT_Z_RZ to %d\n",
+                g_right_stick_invert_z_rz);
     }
     else if (strcmp(filename, "ANALOGSENSITIVITY") == 0) {
         int v = atoi(new_value);

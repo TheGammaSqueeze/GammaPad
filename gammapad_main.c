@@ -103,6 +103,9 @@ int g_dpad_analog_swap = 0;
 int g_left_stick_invert  = 0;
 int g_right_stick_invert = 0;
 
+/* Invert extra triggers Z & RZ: 0 = off, 1 = invert ABS_Z & ABS_RZ */
+int g_right_stick_invert_z_rz = 0;
+
 /* analog sensitivity (-3…+3) */
 int g_analog_sensitivity = 0;
 
