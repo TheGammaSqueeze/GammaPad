@@ -761,7 +761,7 @@ void forward_physical_event(const struct input_event* ev)
             if (axisSc >= 0) {
                 int full = (g_discoveredAxes[axisSc]
                             ? getPhysicalAbsMax(axisSc)
-                            : 16384);
+                            : 255);
                 struct input_event outAbs[2] = {};
                 outAbs[0].type  = EV_ABS;
                 outAbs[0].code  = axisCode;
