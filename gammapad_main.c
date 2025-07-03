@@ -394,7 +394,9 @@ int g_deadzone = 0;
  /* open_physical_ff_device() for FF devices */
  static int open_physical_ff_device(const char* path);
  
- /* doPollForDevicesThread(): polls for new devices. */
+/*
+ * doPollForDevicesThread(): polls for new devices.
+ */
 static void* doPollForDevicesThread(void* arg)
 {
     (void)arg;
@@ -497,18 +499,11 @@ static void* doPollForDevicesThread(void* arg)
                     continue;
                 }
 
-                // Remove old aggregator fds
-                for (int p = 0; p < g_physCount; p++) {
-                    if (g_physFds[p] >= 0) {
-                        remove_epoll_fd(g_epfd, g_physFds[p]);
-                        g_physFds[p] = -1;
-                    }
+                // Replace only this aggregator index FD
+                if (g_physFds[dIndex] >= 0) {
+                    remove_epoll_fd(g_epfd, g_physFds[dIndex]);
                 }
-                g_physCount = 0;
-
-                // Adopt the new aggregator FD
-                g_physFds[0] = testAggFd;
-                g_physCount   = 1;
+                g_physFds[dIndex] = testAggFd;
 
                 // Grab primary if needed
                 if (dIndex == 0) {
@@ -521,10 +516,17 @@ static void* doPollForDevicesThread(void* arg)
                     }
                 }
 
+                // Add it back into epoll loop
+                add_epoll_fd(g_epfd, testAggFd);
+
+                // Ensure we account for all slots
+                if (g_physCount < g_allAggCount) {
+                    g_physCount = g_allAggCount;
+                }
+
                 fprintf(stderr,
                     "[GammaPad] Poll ⇒ recaptured aggregator ⇒ %s ⇒ fd=%d ⇒ dIndex=%d\n",
                     fullPath, testAggFd, dIndex);
-                add_epoll_fd(g_epfd, testAggFd);
 
                 // 3) If FF and aggregator are the same device, unify
                 if (isSameDevice) {
@@ -537,7 +539,7 @@ static void* doPollForDevicesThread(void* arg)
                     fprintf(stderr,
                         "[GammaPad] Poll ⇒ unified FF/aggregator ⇒ %s ⇒ fd=%d\n",
                         fullPath, testAggFd);
-                    // No need to call add_epoll_fd again; it's already in epoll
+                    // already in epoll
                 }
 
                 break;
@@ -554,7 +556,7 @@ static void* doPollForDevicesThread(void* arg)
     return NULL;
 }
  
- /*
+/*
   * main(): entry point.
   */
  int main(int argc, char** argv)
@@ -673,58 +675,13 @@ static void* doPollForDevicesThread(void* arg)
          }
          return 1;
      }
- 
+
      fprintf(stderr, "GammaPad Virtual Controller (fd=%d)\n", controllerFd);
      fprintf(stderr, "GammaPad Virtual Mouse       (fd=%d)\n", mouseFd);
- 
-    //
-    // === NEW: rebind driver, re-open & re-grab primary phys device ===
-    //
-    bindPrimaryDriver();
 
-    if (g_physCount > 0) {
-        /* close stale descriptor */
-        if (g_physFds[0] >= 0) {
-            close(g_physFds[0]);
-            g_physFds[0] = -1;
-        }
-        /* re-open fresh device node and grab */
-        char* physPath = maybeResolveDevicePath(g_allAggregatorDevices[0]);
-        int newFd = open_physical_device(physPath);
-        free(physPath);
-        if (newFd < 0) {
-            fprintf(stderr,
-                "[GammaPad] Failed to re-open primary physical device\n");
-        } else {
-            g_physFds[0] = newFd;
-            g_physCount    = 1;
-            if (ioctl(newFd, EVIOCGRAB, 1) < 0) {
-                perror("EVIOCGRAB on primary physical device");
-            } else {
-                fprintf(stderr,
-                    "[GammaPad] EVIOCGRAB applied on primary device fd=%d\n",
-                    newFd);
-            }
-        }
-    }
-
-    /* === NEW: re-open FF device so uinput→physical FF forwarding still works after driver rebind === */
-    if (g_ffArg) {
-        /* close old ff fd if still open */
-        if (g_ffPhysicalFd >= 0) {
-            close(g_ffPhysicalFd);
-            g_ffPhysicalFd = -1;
-            g_hasPhysicalFF = 0;
-        }
-        /* resolve & reopen */
-        char* ffPath = maybeResolveDevicePath(g_ffArg);
-        g_ffPhysicalFd = open_physical_ff_device(ffPath);
-        free(ffPath);
-        if (g_ffPhysicalFd >= 0) {
-            g_hasPhysicalFF = 1;
-        }
-    }
-
+     //
+     // === set up epoll BEFORE rebind/reopen ===
+     //
      g_epfd = epoll_create1(0);
      if (g_epfd < 0) {
          perror("epoll_create1");
@@ -743,7 +700,7 @@ static void* doPollForDevicesThread(void* arg)
          }
          return 1;
      }
- 
+
      add_epoll_fd(g_epfd, controllerFd);
      for (int i = 0; i < g_physCount; i++) {
          add_epoll_fd(g_epfd, g_physFds[i]);
@@ -752,12 +709,73 @@ static void* doPollForDevicesThread(void* arg)
      if (g_ffPhysicalFd >= 0) {
          add_epoll_fd(g_epfd, g_ffPhysicalFd);
      }
- 
+
      pthread_t pollThread;
      if (pthread_create(&pollThread, NULL, doPollForDevicesThread, NULL) != 0) {
          fprintf(stderr, "[GammaPad] Could not create poll thread => no re-capture logic.\n");
      }
- 
+
+    //
+    // === NEW: rebind driver, re-open & re-grab *all* aggregator devices ===
+    //
+    bindPrimaryDriver();
+
+    // 1) Tear down any old physical‐device FDs
+    for (int i = 0; i < g_physCount; i++) {
+        if (g_physFds[i] >= 0) {
+            remove_epoll_fd(g_epfd, g_physFds[i]);
+            ioctl(g_physFds[i], EVIOCGRAB, 0);
+            g_physFds[i] = -1;
+        }
+    }
+    g_physCount = 0;
+
+    // 2) Re-open each configured aggregator device, re-add to epoll
+    for (int i = 0; i < g_allAggCount; i++) {
+        char* physPath = maybeResolveDevicePath(g_allAggregatorDevices[i]);
+        int fd = open_physical_device(physPath);
+        free(physPath);
+
+        if (fd < 0) {
+            fprintf(stderr,
+                "[GammaPad] Failed to re-open aggregator device '%s'\n",
+                g_allAggregatorDevices[i]);
+            continue;
+        }
+
+        // For the primary (index 0), grab it so we hide its events
+        if (i == 0) {
+            if (ioctl(fd, EVIOCGRAB, 1) < 0) {
+                perror("EVIOCGRAB on primary physical device");
+            } else {
+                fprintf(stderr,
+                    "[GammaPad] EVIOCGRAB applied on primary device fd=%d\n",
+                    fd);
+            }
+        }
+
+        // Add into our fd list and epoll loop
+        g_physFds[g_physCount++] = fd;
+        add_epoll_fd(g_epfd, fd);
+    }
+
+    /* === NEW: re-open FF device so uinput→physical FF forwarding still works after driver rebind === */
+    if (g_ffArg) {
+        if (g_ffPhysicalFd >= 0) {
+            remove_epoll_fd(g_epfd, g_ffPhysicalFd);
+            close(g_ffPhysicalFd);
+            g_ffPhysicalFd = -1;
+            g_hasPhysicalFF = 0;
+        }
+        char* ffPath = maybeResolveDevicePath(g_ffArg);
+        g_ffPhysicalFd = open_physical_ff_device(ffPath);
+        free(ffPath);
+        if (g_ffPhysicalFd >= 0) {
+            g_hasPhysicalFF = 1;
+            add_epoll_fd(g_epfd, g_ffPhysicalFd);
+        }
+    }
+
      fprintf(stderr,
          "=== GAMMAPAD COMMANDS ===\n"
          " press <button> [ms]\n"
@@ -774,7 +792,7 @@ static void* doPollForDevicesThread(void* arg)
          "   abs_gas, abs_brake, abs_hat0x, abs_hat0y\n"
          "==========================\n"
      );
- 
+
     struct epoll_event events[EPOLL_MAX_EVENTS];
 
     while (!g_shouldExit) {
@@ -791,7 +809,7 @@ static void* doPollForDevicesThread(void* arg)
             int fd = events[i].data.fd;
             uint32_t ev = events[i].events;
 
-            if (!(ev & EPOLLIN)) 
+            if (!(ev & EPOLLIN))
                 continue;
 
             if (fd == controllerFd) {
@@ -829,7 +847,7 @@ static void* doPollForDevicesThread(void* arg)
             }
         }
     }
- 
+
      close(g_epfd);
      g_shouldExit = 1;
      pthread_join(pollThread, NULL);
