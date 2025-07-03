@@ -52,4 +52,14 @@ void removePrimaryPhysicalNode(void);
  */
 void unbindAndRebind(void);
 
+/*
+ * Unbind only the primary device’s driver (3×), but do not re-bind.
+ */
+void unbindPrimaryDriver(void);
+
+/*
+ * Bind only the primary device’s driver (3×).
+ */
+void bindPrimaryDriver(void);
+
 #endif // GAMMAPAD_CAPTURE_H

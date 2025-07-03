@@ -281,6 +281,58 @@ void unbindAndRebind(void)
 }
 
 /*
+ * unbindPrimaryDriver:
+ *   Write g_deviceName into <driverPath>/unbind three times.
+ */
+void unbindPrimaryDriver(void)
+{
+    if (!gHasDriver || !g_driverPath[0] || !g_deviceName[0]) {
+        fprintf(stderr, "[GammaPadCapture] unbindPrimaryDriver: no driver info, skipping.\n");
+        return;
+    }
+    fprintf(stderr, "[GammaPadCapture] unbindPrimaryDriver => unbinding driver 3×.\n");
+    for (int i = 1; i <= 3; i++) {
+        char unbindPath[512];
+        snprintf(unbindPath, sizeof(unbindPath), "%s/unbind", g_driverPath);
+        FILE* f = fopen(unbindPath, "w");
+        if (!f) {
+            fprintf(stderr, "[GammaPadCapture] unbind #%d => open fail => %s\n", i, strerror(errno));
+        } else {
+            fprintf(stderr, "[GammaPadCapture] unbind #%d => writing '%s'\n", i, g_deviceName);
+            fprintf(f, "%s\n", g_deviceName);
+            fclose(f);
+        }
+        sleep(1);
+    }
+}
+
+/*
+ * bindPrimaryDriver:
+ *   Write g_deviceName into <driverPath>/bind three times.
+ */
+void bindPrimaryDriver(void)
+{
+    if (!gHasDriver || !g_driverPath[0] || !g_deviceName[0]) {
+        fprintf(stderr, "[GammaPadCapture] bindPrimaryDriver: no driver info, skipping.\n");
+        return;
+    }
+    fprintf(stderr, "[GammaPadCapture] bindPrimaryDriver => binding driver 3×.\n");
+    for (int i = 1; i <= 3; i++) {
+        char bindPath[512];
+        snprintf(bindPath, sizeof(bindPath), "%s/bind", g_driverPath);
+        FILE* f = fopen(bindPath, "w");
+        if (!f) {
+            fprintf(stderr, "[GammaPadCapture] bind #%d => open fail => %s\n", i, strerror(errno));
+        } else {
+            fprintf(stderr, "[GammaPadCapture] bind #%d => writing '%s'\n", i, g_deviceName);
+            fprintf(f, "%s\n", g_deviceName);
+            fclose(f);
+        }
+        sleep(1);
+    }
+}
+
+/*
  * We'll do collision resolution so triggers overshadow normal axes,
  * or bigger-range scancodes overshadow smaller-range if mapped to same axis.
  */

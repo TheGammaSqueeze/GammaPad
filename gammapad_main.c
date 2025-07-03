@@ -87,6 +87,8 @@
  /* Optional FF device argument (--ffdev=...) */
  static char* g_ffArg = NULL;
  
+static char* g_ffPath = NULL; // absolute “/dev/input/eventN” of the FF device
+
  /* New parameters for FF and UI */
  int g_ffDivisor = 1;
  float g_ffMagnitudeMultiplier = 1.0f;
@@ -393,126 +395,159 @@ int g_deadzone = 0;
  static int open_physical_ff_device(const char* path);
  
  /* doPollForDevicesThread(): polls for new devices. */
- static void* doPollForDevicesThread(void* arg)
- {
-     (void)arg;
-     #define MAX_KNOWN_NODES 128
-     char knownNodes[MAX_KNOWN_NODES][128];
-     int knownCount = 0;
-     {
-         DIR* d = opendir("/dev/input");
-         if(d){
-             struct dirent* de;
-             while((de = readdir(d))){
-                 if(!strncmp(de->d_name, "event", 5)){
-                     snprintf(knownNodes[knownCount], sizeof(knownNodes[knownCount]), "%s", de->d_name);
-                     knownCount++;
-                     if(knownCount >= MAX_KNOWN_NODES) break;
-                 }
-             }
-             closedir(d);
-         }
-     }
-     while(!g_shouldExit){
-         sleep(1);
-         char currentNodes[MAX_KNOWN_NODES][128];
-         int currCount = 0;
-         {
-             DIR* d = opendir("/dev/input");
-             if(d){
-                 struct dirent* de;
-                 while((de = readdir(d))){
-                     if(!strncmp(de->d_name, "event", 5)){
-                         snprintf(currentNodes[currCount], sizeof(currentNodes[currCount]), "%s", de->d_name);
-                         currCount++;
-                         if(currCount >= MAX_KNOWN_NODES) break;
-                     }
-                 }
-                 closedir(d);
-             }
-         }
-         for(int i = 0; i < currCount; i++){
-             int found = 0;
-             for(int k = 0; k < knownCount; k++){
-                 if(!strcmp(currentNodes[i], knownNodes[k])){
-                     found = 1;
-                     break;
-                 }
-             }
-             if(!found){
-                 char fullPath[256];
-                 snprintf(fullPath, sizeof(fullPath), "/dev/input/%s", currentNodes[i]);
-                 if(g_ffPhysicalFd < 0 && g_ffArg){
-                     int testFd = open_physical_ff_device(fullPath);
-                     if(testFd >= 0){
-                         if(g_ffPhysicalFd >= 0){
-                             remove_epoll_fd(g_epfd, g_ffPhysicalFd);
-                             g_ffPhysicalFd = -1;
-                             g_hasPhysicalFF = 0;
-                         }
-                         g_ffPhysicalFd = testFd;
-                         g_hasPhysicalFF = 1;
-                         fprintf(stderr, "[GammaPad] Poll => recaptured ffdev => %s => fd=%d\n", fullPath, testFd);
-                         add_epoll_fd(g_epfd, g_ffPhysicalFd);
-                         continue;
-                     }
-                 }
-                 for(int dIndex = 0; dIndex < g_allAggCount; dIndex++){
-                     int testAggFd = open_physical_device(fullPath);
-                     if(testAggFd >= 0){
-                         char devName[256];
-                         memset(devName, 0, sizeof(devName));
-                         if(ioctl(testAggFd, EVIOCGNAME(sizeof(devName)), devName) < 0){
-                             devName[0] = '\0';
-                         }
-                         if(strcmp(devName, g_allAggregatorDevices[dIndex]) != 0){
-                             close(testAggFd);
-                             testAggFd = -1;
-                             continue;
-                         }
-                         for(int p = 0; p < g_physCount; p++){
-                             if(g_physFds[p] >= 0){
-                                 remove_epoll_fd(g_epfd, g_physFds[p]);
-                                 g_physFds[p] = -1;
-                             }
-                         }
-                         g_physCount = 0;
-                         g_physFds[0] = testAggFd;
-                         g_physCount = 1;
-                         add_epoll_fd(g_epfd, testAggFd);
-                         if(dIndex == 0){
-                             fprintf(stderr, "[GammaPad] Poll => recaptured aggregator => primary => removing node.\n");
-                             char rmCmd[256];
-                             snprintf(rmCmd, sizeof(rmCmd), "rm -f '%s'", fullPath);
-                             system(rmCmd);
-                         } else {
-                             fprintf(stderr, "[GammaPad] Poll => recaptured aggregator => secondary => no node removal.\n");
-                         }
-                         fprintf(stderr, "[GammaPad] Poll => recaptured aggregator => %s => fd=%d => dIndex=%d\n", fullPath, testAggFd, dIndex);
-                         break;
-                     }
-                 }
-             }
-         }
-         for(int k = 0; k < knownCount; k++){
-             int found = 0;
-             for(int i = 0; i < currCount; i++){
-                 if(!strcmp(knownNodes[k], currentNodes[i])){
-                     found = 1;
-                     break;
-                 }
-             }
-             if(!found){
-                 fprintf(stderr, "[GammaPad] Poll => node removed => %s => ignoring.\n", knownNodes[k]);
-             }
-         }
-         knownCount = currCount;
-         for(int i = 0; i < knownCount; i++){
-             strcpy(knownNodes[i], currentNodes[i]);
-         }
-     }
-     return NULL;
- }
+static void* doPollForDevicesThread(void* arg)
+{
+    (void)arg;
+    #define MAX_KNOWN_NODES 128
+    char knownNodes[MAX_KNOWN_NODES][128];
+    int knownCount = 0;
+
+    /* Prime the list of known nodes */
+    {
+        DIR* d = opendir("/dev/input");
+        if (d) {
+            struct dirent* de;
+            while ((de = readdir(d))) {
+                if (!strncmp(de->d_name, "event", 5) && knownCount < MAX_KNOWN_NODES) {
+                    strncpy(knownNodes[knownCount], de->d_name, sizeof(knownNodes[0]) - 1);
+                    knownNodes[knownCount][sizeof(knownNodes[0]) - 1] = '\0';
+                    knownCount++;
+                }
+            }
+            closedir(d);
+        }
+    }
+
+    while (!g_shouldExit) {
+        sleep(1);
+
+        /* Scan current nodes */
+        char currentNodes[MAX_KNOWN_NODES][128];
+        int currCount = 0;
+        {
+            DIR* d = opendir("/dev/input");
+            if (d) {
+                struct dirent* de;
+                while ((de = readdir(d))) {
+                    if (!strncmp(de->d_name, "event", 5) && currCount < MAX_KNOWN_NODES) {
+                        strncpy(currentNodes[currCount], de->d_name, sizeof(currentNodes[0]) - 1);
+                        currentNodes[currCount][sizeof(currentNodes[0]) - 1] = '\0';
+                        currCount++;
+                    }
+                }
+                closedir(d);
+            }
+        }
+
+        /* Handle newly appeared nodes */
+        for (int i = 0; i < currCount; i++) {
+            bool found = false;
+            for (int k = 0; k < knownCount; k++) {
+                if (!strcmp(currentNodes[i], knownNodes[k])) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                char fullPath[256];
+                snprintf(fullPath, sizeof(fullPath), "/dev/input/%s", currentNodes[i]);
+
+                /* Try to reopen *only* our chosen FF device */
+                if (g_ffPath && !strcmp(fullPath, g_ffPath)) {
+                    int testFd = open_physical_ff_device(fullPath);
+                    if (testFd >= 0) {
+                        /* close old, if still open */
+                        if (g_ffPhysicalFd >= 0) {
+                            remove_epoll_fd(g_epfd, g_ffPhysicalFd);
+                            close(g_ffPhysicalFd);
+                            g_hasPhysicalFF = 0;
+                        }
+                        /* adopt the new one */
+                        g_ffPhysicalFd = testFd;
+                        g_hasPhysicalFF = 1;
+                        fprintf(stderr,
+                            "[GammaPad] Poll => recaptured FF dev => %s => fd=%d\n",
+                            fullPath, testFd);
+                        add_epoll_fd(g_epfd, testFd);
+                        continue;
+                    }
+                }
+
+                /* Try to open as one of the aggregator devices */
+                for (int dIndex = 0; dIndex < g_allAggCount; dIndex++) {
+                    int testAggFd = open_physical_device(fullPath);
+                    if (testAggFd < 0)
+                        continue;
+
+                    /* Verify it’s the same named device */
+                    char devName[256] = {0};
+                    if (ioctl(testAggFd, EVIOCGNAME(sizeof(devName)), devName) < 0) {
+                        devName[0] = '\0';
+                    }
+                    if (strcmp(devName, g_allAggregatorDevices[dIndex]) != 0) {
+                        close(testAggFd);
+                        continue;
+                    }
+
+                    /* Remove any old aggregator fds from epoll and close them */
+                    for (int p = 0; p < g_physCount; p++) {
+                        if (g_physFds[p] >= 0) {
+                            remove_epoll_fd(g_epfd, g_physFds[p]);
+                            g_physFds[p] = -1;
+                        }
+                    }
+                    g_physCount = 0;
+
+                    /* Adopt the new fd */
+                    g_physFds[0] = testAggFd;
+                    g_physCount   = 1;
+
+                    /* If it’s the primary device, grab it */
+                    if (dIndex == 0) {
+                        if (ioctl(testAggFd, EVIOCGRAB, 1) < 0) {
+                            perror("EVIOCGRAB on reconnected primary physical device");
+                        } else {
+                            fprintf(stderr,
+                                "[GammaPad] EVIOCGRAB re-applied on primary fd=%d\n",
+                                testAggFd);
+                        }
+                    }
+
+                    fprintf(stderr,
+                        "[GammaPad] Poll => recaptured aggregator => %s => fd=%d => dIndex=%d\n",
+                        fullPath, testAggFd, dIndex);
+
+                    add_epoll_fd(g_epfd, testAggFd);
+
+                    break;
+                }
+            }
+        }
+
+        /* Optionally, log removed nodes (not strictly necessary) */
+        for (int k = 0; k < knownCount; k++) {
+            bool stillExists = false;
+            for (int i = 0; i < currCount; i++) {
+                if (!strcmp(knownNodes[k], currentNodes[i])) {
+                    stillExists = true;
+                    break;
+                }
+            }
+            if (!stillExists) {
+                fprintf(stderr, "[GammaPad] Poll => node removed => %s => ignoring.\n",
+                        knownNodes[k]);
+            }
+        }
+
+        /* Update knownNodes for next iteration */
+        knownCount = currCount;
+        for (int i = 0; i < knownCount; i++) {
+            strcpy(knownNodes[i], currentNodes[i]);
+        }
+    }
+
+    return NULL;
+}
  
  /*
   * main(): entry point.
@@ -567,8 +602,13 @@ int g_deadzone = 0;
  
      if (g_ffArg) {
          char* resolvedFF = maybeResolveDevicePath(g_ffArg);
-         g_ffPhysicalFd = open_physical_ff_device(resolvedFF);
-         free(resolvedFF);
+         g_ffPath = maybeResolveDevicePath(g_ffArg);
+        if (g_ffPhysicalFd >= 0) {
+            g_hasPhysicalFF = 1;
+        } else {
+            free(g_ffPath);
+            g_ffPath = NULL;
+        }
          if (g_ffPhysicalFd >= 0) {
              g_hasPhysicalFF = 1;
          }
@@ -598,6 +638,11 @@ int g_deadzone = 0;
                  "chmod -R 777 %s", CONFIG_DIR);
         system(chmodCmd);
     }
+
+    //
+    // === NEW: unbind driver before creating uinput device ===
+    //
+    unbindPrimaryDriver();
 
     /* (Then continue on to create the virtual devices…) */
      if (create_virtual_controller(&controllerFd) < 0) {
@@ -635,8 +680,54 @@ int g_deadzone = 0;
      fprintf(stderr, "GammaPad Virtual Controller (fd=%d)\n", controllerFd);
      fprintf(stderr, "GammaPad Virtual Mouse       (fd=%d)\n", mouseFd);
  
-     removePrimaryPhysicalNode();
- 
+    //
+    // === NEW: rebind driver, re-open & re-grab primary phys device ===
+    //
+    bindPrimaryDriver();
+
+    if (g_physCount > 0) {
+        /* close stale descriptor */
+        if (g_physFds[0] >= 0) {
+            close(g_physFds[0]);
+            g_physFds[0] = -1;
+        }
+        /* re-open fresh device node and grab */
+        char* physPath = maybeResolveDevicePath(g_allAggregatorDevices[0]);
+        int newFd = open_physical_device(physPath);
+        free(physPath);
+        if (newFd < 0) {
+            fprintf(stderr,
+                "[GammaPad] Failed to re-open primary physical device\n");
+        } else {
+            g_physFds[0] = newFd;
+            g_physCount    = 1;
+            if (ioctl(newFd, EVIOCGRAB, 1) < 0) {
+                perror("EVIOCGRAB on primary physical device");
+            } else {
+                fprintf(stderr,
+                    "[GammaPad] EVIOCGRAB applied on primary device fd=%d\n",
+                    newFd);
+            }
+        }
+    }
+
+    /* === NEW: re-open FF device so uinput→physical FF forwarding still works after driver rebind === */
+    if (g_ffArg) {
+        /* close old ff fd if still open */
+        if (g_ffPhysicalFd >= 0) {
+            close(g_ffPhysicalFd);
+            g_ffPhysicalFd = -1;
+            g_hasPhysicalFF = 0;
+        }
+        /* resolve & reopen */
+        char* ffPath = maybeResolveDevicePath(g_ffArg);
+        g_ffPhysicalFd = open_physical_ff_device(ffPath);
+        free(ffPath);
+        if (g_ffPhysicalFd >= 0) {
+            g_hasPhysicalFF = 1;
+        }
+    }
+
      g_epfd = epoll_create1(0);
      if (g_epfd < 0) {
          perror("epoll_create1");
