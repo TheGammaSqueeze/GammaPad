@@ -60,6 +60,20 @@
  extern int g_hasPhysicalFF;
  extern int controllerFd;
  static const char* VIB_PATH = "/sys/class/timed_output/vibrator/enable";
+
+ /* New Retroid Pocket Classic flag */
+extern int g_rpclassic;
+
+// Helper: try writing `data` to `path`, return 0 on success or -1 on error (errno set)
+static int writeSysfs(const char *path, const char *data) {
+    int fd = open(path, O_WRONLY);
+    if (fd < 0) {
+        return -1;
+    }
+    ssize_t w = write(fd, data, strlen(data));
+    close(fd);
+    return (w == (ssize_t)strlen(data)) ? 0 : -1;
+}
  
  static int test_effect_support(__u16 effect) {
      if (!(g_hasPhysicalFF && g_ffPhysicalFd >= 0))
@@ -492,6 +506,46 @@
     struct AggregatorEffect* slot = aggregatorFindSlotByKid(aggregatorKid);
     if (!slot || !slot->used) {
         LOG_FF("[FF] No active rumble effect slot found; ignoring play event\n");
+        return;
+    }
+
+    if (g_rpclassic && slot->ffType == FF_RUMBLE) {
+        char buf[32];
+        int ok;
+
+        if (doPlay) {
+            /* 1) Write duration (ms) */
+            snprintf(buf, sizeof(buf), "%u", slot->durationMs);
+            ok = writeSysfs("/sys/class/leds/vibrator/activate/duration", buf);
+            if (ok == 0) {
+                LOG_FF("[RPCLASSIC] duration → activate/duration = %sms\n", buf);
+            } else if (writeSysfs("/sys/class/leds/vibrator/duration", buf) == 0) {
+                LOG_FF("[RPCLASSIC] duration → duration = %sms\n", buf);
+            } else if (writeSysfs("/sys/class/timed_output/vibrator/enable", buf) == 0) {
+                LOG_FF("[RPCLASSIC] duration → timed_output = %sms\n", buf);
+            } else {
+                LOG_FF("[RPCLASSIC] Failed to set duration via any path: %s\n", strerror(errno));
+            }
+
+            /* 2) Activate vibration */
+            ok = writeSysfs("/sys/class/leds/vibrator/activate", "1");
+            if (ok == 0) {
+                LOG_FF("[RPCLASSIC] vibrate → activate = 1\n");
+            } else if (writeSysfs("/sys/class/timed_output/vibrator/enable", buf) == 0) {
+                LOG_FF("[RPCLASSIC] vibrate → timed_output = %sms\n", buf);
+            } else {
+                LOG_FF("[RPCLASSIC] Failed to activate vibrator: %s\n", strerror(errno));
+            }
+        } else {
+            /* Stop vibration early */
+            if (writeSysfs("/sys/class/leds/vibrator/activate", "0") == 0) {
+                LOG_FF("[RPCLASSIC] vibrate → activate = 0\n");
+            } else if (writeSysfs("/sys/class/timed_output/vibrator/enable", "0") == 0) {
+                LOG_FF("[RPCLASSIC] vibrate → timed_output = 0\n");
+            } else {
+                LOG_FF("[RPCLASSIC] Failed to stop vibrator: %s\n", strerror(errno));
+            }
+        }
         return;
     }
 

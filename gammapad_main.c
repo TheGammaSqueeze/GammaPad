@@ -117,6 +117,9 @@ int g_gas_brake_emulation  = 0;
 /* configurable deadzone percentage (0…100) */
 int g_deadzone = 0;
 
+/* Retroid Classic vibrator override: route rumble via sysfs */  
+int g_rpclassic = 0;
+
  /*
   * function prototypes...
   */
@@ -240,7 +243,11 @@ int g_deadzone = 0;
              dummy_upload_ff_effect(&ffup.effect);
              ffup.retval = 0;
              if(!ioctl(controllerFd, UI_END_FF_UPLOAD, &ffup)){
-                 storeUploadedEffect(&ffup.effect);
+                storeUploadedEffect(&ffup.effect);
+                // >>> RPCLASSIC: start immediately on upload
+                if (g_rpclassic && ffup.effect.type == FF_RUMBLE) {
+                    ff_play_effect(ffup.effect.id, 1);
+                }
              }
          }
      } else if(ev->code == UI_FF_ERASE){
@@ -250,7 +257,12 @@ int g_deadzone = 0;
          if(!ioctl(controllerFd, UI_BEGIN_FF_ERASE, &fferase)){
              dummy_erase_ff_effect(fferase.effect_id);
              fferase.retval = 0;
-             ioctl(controllerFd, UI_END_FF_ERASE, &fferase);
+            if (!ioctl(controllerFd, UI_END_FF_ERASE, &fferase)) {
+               // >>> RPCLASSIC: stop immediately on erase
+               if (g_rpclassic) {
+                   ff_play_effect(fferase.effect_id, 0);
+               }
+            }
          }
      }
  }
@@ -587,6 +599,9 @@ static void* doPollForDevicesThread(void* arg)
              if (g_ffPwmMaxMagnitude <= 0) g_ffPwmMaxMagnitude = 32767;
          } else if (!strcmp(argv[i], "--ffpwm")) {
              g_ffPwmEnabled = 1;
+         } else if (!strcmp(argv[i], "--rpclassic")) {
+             g_rpclassic = 1;
+             fprintf(stderr, "CLI: Retroid Pocket Classic vibrator mode enabled\n");
          } else if (!strncmp(argv[i], "--uibus=", 8)) {
              g_uibus = atoi(argv[i] + 8);
          } else if (!strncmp(argv[i], "--uivid=", 8)) {

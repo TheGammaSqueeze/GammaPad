@@ -20,7 +20,7 @@
  * If you want more logs, compile with -DGAMMAPAD_VERBOSE_LOGGING=1
  */
 #ifndef GAMMAPAD_VERBOSE_LOGGING
-#define GAMMAPAD_VERBOSE_LOGGING 0
+#define GAMMAPAD_VERBOSE_LOGGING 1
 #endif
 
 /* Logging macro for Force Feedback if verbose logging is enabled. */
@@ -97,6 +97,9 @@ extern int g_gas_brake_emulation;
 /* Configurable deadzone percentage (0…100).  
    Values within ±(deadzone% of half-range) around center will be treated as center. */
 extern int g_deadzone;
+
+/* New: Retroid Pocket Classic vibrator mode */  
+extern int g_rpclassic;
 
 /*
  * New virtual controller parameters (set via command-line):
