@@ -115,12 +115,20 @@ int create_virtual_controller(int* fd_out) {
     }
 
     /* Core bits */
-    ioctl(fd, UI_SET_EVBIT, EV_KEY);
-    ioctl(fd, UI_SET_EVBIT, EV_ABS);
-    ioctl(fd, UI_SET_PROPBIT, INPUT_PROP_DIRECT);
-    ioctl(fd, UI_SET_EVBIT, EV_UINPUT);
-    /* Enable force feedback events */
-    ioctl(fd, UI_SET_EVBIT, EV_FF);
+    if (ioctl(fd, UI_SET_EVBIT, EV_KEY)  < 0 ||
+        ioctl(fd, UI_SET_EVBIT, EV_ABS)  < 0 ||
+        ioctl(fd, UI_SET_EVBIT, EV_SYN)  < 0 ||
+        ioctl(fd, UI_SET_EVBIT, EV_FF)   < 0) {
+        LOG_FF("create_virtual_controller: UI_SET_EVBIT => %s\n", strerror(errno));
+        close(fd);
+        return -1;
+    }
+
+    if (ioctl(fd, UI_SET_PROPBIT, INPUT_PROP_DIRECT) < 0) {
+        LOG_FF("create_virtual_controller: UI_SET_PROPBIT => %s\n", strerror(errno));
+        close(fd);
+        return -1;
+    }
 
     extern int g_ffPhysicalFd;
     extern int g_hasPhysicalFF;

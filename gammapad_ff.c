@@ -242,15 +242,26 @@ static int writeSysfs(const char *path, const char *data) {
  /* --- New function: sweepExpiredEffects ---
       Iterates over all stored effects and clears any that have expired.
  */
- static void sweepExpiredEffects(void) {
-     unsigned long long now = getTimeMs();
-     for (int i = 0; i < MAX_EFFECTS; i++) {
-         if (gEffects[i].used && (now - gEffects[i].startTimeMs >= gEffects[i].durationMs)) {
-             LOG_FF("[FF] sweepExpiredEffects: Clearing expired effect aggregatorKid=%d\n", gEffects[i].aggregatorKid);
-             aggregatorClearSlot(&gEffects[i]);
-         }
-     }
- }
+static void sweepExpiredEffects(void) {
+    unsigned long long now = getTimeMs();
+    int usedCount = 0;
+    for (int i = 0; i < MAX_EFFECTS; i++) {
+        if (gEffects[i].used) {
+            usedCount++;
+        }
+    }
+    // only clear expired slots when we've used them all
+    if (usedCount < MAX_EFFECTS)
+        return;
+
+    for (int i = 0; i < MAX_EFFECTS; i++) {
+        if (gEffects[i].used
+            && gEffects[i].ffType != FF_RUMBLE
+            && (now - gEffects[i].startTimeMs >= gEffects[i].durationMs)) {
+            aggregatorClearSlot(&gEffects[i]);
+        }
+    }
+}
  
  /* --- New: Define update_rumble_state ---
       This function sweeps expired effects and updates the PWM or direct FF state.
@@ -541,7 +552,7 @@ static void aggregatorClearSlot(struct AggregatorEffect* slot) {
      return 0;
  }
   
- void ff_play_effect(int aggregatorKid, int doPlay) {
+void ff_play_effect(int aggregatorKid, int doPlay) {
     LOG_FF("[FF] ff_play_effect: aggregatorKid=%d, doPlay=%d\n", aggregatorKid, doPlay);
     struct AggregatorEffect* slot = aggregatorFindSlotByKid(aggregatorKid);
     if (!slot || !slot->used) {
@@ -599,16 +610,43 @@ static void aggregatorClearSlot(struct AggregatorEffect* slot) {
                 update_rumble_state();
                 LOG_FF("[FF] Starter ping for aggregatorKid=%d\n", aggregatorKid);
             } else {
-                /* IMMEDIATE STOP — send an “off” and clear slot */
-                LOG_FF("[FF] Immediate stop for aggregatorKid=%d\n", aggregatorKid);
-                struct input_event ev = {0};
-                ev.type  = EV_FF;
-                ev.code  = effectId;
-                ev.value = 0;
-                if (write(g_ffPhysicalFd, &ev, sizeof(ev)) < 0) {
-                    LOG_FF("[FF] ff_play_effect: write off failed: %s\n", strerror(errno));
+                /* STOP — ensure full intended duration before cutting off */
+                unsigned long long now = getTimeMs();
+                unsigned long long elapsed = now - slot->startTimeMs;
+                if (elapsed < slot->durationMs) {
+                    /* schedule delayed stop for remaining time */
+                    unsigned int rem = slot->durationMs - elapsed;
+                    struct DelayedStopArg *dsArg = malloc(sizeof(*dsArg));
+                    if (dsArg) {
+                        dsArg->slot = slot;
+                        dsArg->remainingMs = rem;
+                        pthread_t th;
+                        if (pthread_create(&th, NULL, delayedStopThread, dsArg) == 0) {
+                            pthread_detach(th);
+                            LOG_FF("[FF] Scheduled delayed stop for aggregatorKid=%d in %u ms\n",
+                                   slot->aggregatorKid, rem);
+                        } else {
+                            LOG_FF("[FF] Failed to create delayed stop thread: %s\n", strerror(errno));
+                            /* fallback immediate stop */
+                            struct input_event ev = {0};
+                            ev.type  = EV_FF;
+                            ev.code  = effectId;
+                            ev.value = 0;
+                            write(g_ffPhysicalFd, &ev, sizeof(ev));
+                            aggregatorClearSlot(slot);
+                        }
+                    }
+                } else {
+                    /* duration elapsed: immediate stop */
+                    struct input_event ev = {0};
+                    ev.type  = EV_FF;
+                    ev.code  = effectId;
+                    ev.value = 0;
+                    if (write(g_ffPhysicalFd, &ev, sizeof(ev)) < 0) {
+                        LOG_FF("[FF] ff_play_effect: write off failed: %s\n", strerror(errno));
+                    }
+                    aggregatorClearSlot(slot);
                 }
-                aggregatorClearSlot(slot);
             }
             return;
         }
