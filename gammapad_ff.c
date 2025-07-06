@@ -61,63 +61,8 @@
  extern int controllerFd;
  static const char* VIB_PATH = "/sys/class/timed_output/vibrator/enable";
 
-/* Path to the LED sysfs nodes for RP Classic */
-#define RPCLASSIC_DURATION_NODE  "/sys/class/leds/vibrator/duration"
-#define RPCLASSIC_ACTIVATE_NODE  "/sys/class/leds/vibrator/activate"
-static int writeSysfs(const char *path, const char *data);
-
-/* --- RP Classic PWM support via sysfs --- */
-struct RPClassicPWMArg {
-    unsigned int onDur;
-    unsigned int offDur;
-    unsigned int totalMs;
-};
-static pthread_t rpPwmThread = 0;
-static volatile int rpPwmStop = 0;
-
  /* New Retroid Pocket Classic flag */
 extern int g_rpclassic;
-
-/* Thread for pulsing the vibrator LED */
-static void* rpPwmThreadFunc(void* arg) {
-    struct RPClassicPWMArg* p = (struct RPClassicPWMArg*)arg;
-    unsigned int elapsed = 0;
-    while (!rpPwmStop && elapsed < p->totalMs) {
-        /* Turn vibrator ON */
-        writeSysfs(RPCLASSIC_ACTIVATE_NODE, "1");
-        msleep(p->onDur);
-        elapsed += p->onDur;
-        if (rpPwmStop || elapsed >= p->totalMs) break;
-
-        /* Turn vibrator OFF */
-        writeSysfs(RPCLASSIC_ACTIVATE_NODE, "0");
-        msleep(p->offDur);
-        elapsed += p->offDur;
-    }
-    /* Ensure it's off at the end */
-    writeSysfs(RPCLASSIC_ACTIVATE_NODE, "0");
-    free(p);
-    return NULL;
-}
-
-/* Start the RP Classic PWM thread */
-static void startRPClassicPWM(unsigned int onDur, unsigned int offDur, unsigned int totalMs) {
-    rpPwmStop = 0;
-    struct RPClassicPWMArg* arg = malloc(sizeof(*arg));
-    arg->onDur   = onDur;
-    arg->offDur  = offDur;
-    arg->totalMs = totalMs;
-    pthread_create(&rpPwmThread, NULL, rpPwmThreadFunc, arg);
-}
-
-/* Stop the RP Classic PWM thread */
-static void stopRPClassicPWM(void) {
-    if (rpPwmThread) {
-        rpPwmStop = 1;
-        pthread_join(rpPwmThread, NULL);
-        rpPwmThread = 0;
-    }
-}
 
 // Helper: try writing `data` to `path`, return 0 on success or -1 on error (errno set)
 static int writeSysfs(const char *path, const char *data) {
@@ -210,6 +155,60 @@ static int writeSysfs(const char *path, const char *data) {
      close(tfd);
  }
  
+/* --- RP Classic PWM support added here --- */
+
+#define RPCLASSIC_PWM_PERIOD_MS 45
+
+static pthread_t rpPwmThread;
+static volatile int rpPwmShouldStop = 0;
+static volatile int rpPwmActive = 0;
+static volatile unsigned int rpPwmOnDuration = 0;
+static volatile unsigned int rpPwmOffDuration = 0;
+static volatile unsigned int rpPwmDuration = 0;
+
+/* RP Classic PWM thread: toggles sysfs activate on/off */
+static void* rpPwmThreadFunc(void* arg) {
+    (void)arg;
+    unsigned long long end = getTimeMs() + rpPwmDuration;
+    while (!rpPwmShouldStop && getTimeMs() < end) {
+        /* turn on */
+        writeSysfs("/sys/class/leds/vibrator/activate", "1");
+        usleep(rpPwmOnDuration * 1000);
+        if (getTimeMs() >= end || rpPwmShouldStop) break;
+        /* turn off */
+        writeSysfs("/sys/class/leds/vibrator/activate", "0");
+        usleep(rpPwmOffDuration * 1000);
+    }
+    /* ensure off at end */
+    writeSysfs("/sys/class/leds/vibrator/activate", "0");
+    rpPwmActive = 0;
+    return NULL;
+}
+
+static void startRpPwm(unsigned int durationMs, unsigned int magnitude) {
+    if (rpPwmActive) {
+        rpPwmShouldStop = 1;
+        pthread_join(rpPwmThread, NULL);
+        rpPwmActive = 0;
+    }
+    /* compute on/off durations */
+    unsigned int onDur = (magnitude * RPCLASSIC_PWM_PERIOD_MS) / g_ffPwmMaxMagnitude;
+    unsigned int offDur = RPCLASSIC_PWM_PERIOD_MS - onDur;
+    rpPwmOnDuration = onDur;
+    rpPwmOffDuration = offDur;
+    rpPwmDuration = durationMs;
+    rpPwmShouldStop = 0;
+    if (pthread_create(&rpPwmThread, NULL, rpPwmThreadFunc, NULL) == 0) {
+        rpPwmActive = 1;
+        LOG_FF("[RPCLASSIC] PWM started: duration=%u on=%u off=%u\n",
+               durationMs, onDur, offDur);
+    } else {
+        LOG_FF("[RPCLASSIC] PWM thread create failed\n");
+    }
+}
+
+/* --- End of RP Classic PWM additions --- */
+
  static pthread_t pwmThread;
  static volatile int pwmThreadShouldStop = 0;
  static volatile int pwmActive = 0;
@@ -564,53 +563,45 @@ static int writeSysfs(const char *path, const char *data) {
         return;
     }
 
-    /* --- New RP Classic branch with PWM via sysfs --- */
-     if (g_rpclassic && slot->ffType == FF_RUMBLE) {
-         char buf[32];
-         snprintf(buf, sizeof(buf), "%u", slot->durationMs);
+    if (g_rpclassic && slot->ffType == FF_RUMBLE) {
+        char buf[32];
+        unsigned int dur = slot->durationMs;
+        unsigned int mag = slot->original.u.rumble.weak_magnitude;
 
-         /* 1) Set total duration */
-         if (writeSysfs(RPCLASSIC_DURATION_NODE, buf) == 0) {
-             LOG_FF("[RPCLASSIC] Set duration to %sms\n", buf);
-         } else {
-             LOG_FF("[RPCLASSIC] Failed to set duration: %s\n", strerror(errno));
-         }
-
-         if (doPlay) {
-             /* 2a) Play: PWM or constant */
-             if (g_ffPwmEnabled && g_ffPwmMaxMagnitude > 0) {
-                 unsigned int mag = slot->original.u.rumble.weak_magnitude;
-                unsigned int onDur  = (mag * PWM_PERIOD_MS) / g_ffPwmMaxMagnitude;
-                 unsigned int offDur = PWM_PERIOD_MS - onDur;
-                 startRPClassicPWM(onDur, offDur, slot->durationMs);
-                 LOG_FF("[RPCLASSIC] PWM ON=%ums OFF=%ums\n", onDur, offDur);
-             } else {
-                 /* constant */
-                 if (writeSysfs(RPCLASSIC_ACTIVATE_NODE, "1") == 0) {
-                     LOG_FF("[RPCLASSIC] Activated constant vibration\n");
-                 } else {
-                     LOG_FF("[RPCLASSIC] Failed to activate vibrator: %s\n", strerror(errno));
-                 }
-             }
-         } else {
-             /* 2b) Stop: tear down PWM and deactivate */
-             if (g_ffPwmEnabled) {
-                 stopRPClassicPWM();
-                 LOG_FF("[RPCLASSIC] Stopped PWM\n");
-             }
-             if (writeSysfs(RPCLASSIC_ACTIVATE_NODE, "0") == 0) {
-                 LOG_FF("[RPCLASSIC] Deactivated vibrator\n");
-             } else {
-                 LOG_FF("[RPCLASSIC] Failed to deactivate vibrator: %s\n", strerror(errno));
-             }
-         }
-
-        /* --- clear our aggregator slot so resync un-grabs the device --- */
-        aggregatorClearSlot(slot);
-
-         return;
-     }
-     /* --- End RP Classic override --- */
+        if (doPlay) {
+            if (!g_ffPwmEnabled || mag >= g_ffPwmMaxMagnitude) {
+                /* Direct duration-based sysfs write */
+                snprintf(buf, sizeof(buf), "%u", dur);
+                if (writeSysfs("/sys/class/leds/vibrator/duration", buf) == 0) {
+                    LOG_FF("[RPCLASSIC] duration → duration = %sms\n", buf);
+                } else {
+                    LOG_FF("[RPCLASSIC] Failed to set duration: %s\n", strerror(errno));
+                }
+                if (writeSysfs("/sys/class/leds/vibrator/activate", "1") == 0) {
+                    LOG_FF("[RPCLASSIC] vibrate → activate = 1\n");
+                } else {
+                    LOG_FF("[RPCLASSIC] Failed to activate vibrator: %s\n", strerror(errno));
+                }
+            } else {
+                /* PWM via sysfs */
+                startRpPwm(dur, mag);
+            }
+        } else {
+            /* Stop any PWM thread */
+            if (rpPwmActive) {
+                rpPwmShouldStop = 1;
+                pthread_join(rpPwmThread, NULL);
+                rpPwmActive = 0;
+            }
+            /* Ensure immediate off */
+            if (writeSysfs("/sys/class/leds/vibrator/activate", "0") == 0) {
+                LOG_FF("[RPCLASSIC] vibrate → activate = 0\n");
+            } else {
+                LOG_FF("[RPCLASSIC] Failed to stop vibrator: %s\n", strerror(errno));
+            }
+        }
+        return;
+    }
 
     /* If we have a physical device, always passthrough rumble immediately. */
     if (g_hasPhysicalFF && g_ffPhysicalFd >= 0) {
