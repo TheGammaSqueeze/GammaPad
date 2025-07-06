@@ -64,9 +64,6 @@
  /* New Retroid Pocket Classic flag */
 extern int g_rpclassic;
 
-// track the last real FF effect we played on the physical device
-static int lastEffectId = -1;
-
 // Helper: try writing `data` to `path`, return 0 on success or -1 on error (errno set)
 static int writeSysfs(const char *path, const char *data) {
     int fd = open(path, O_WRONLY);
@@ -242,31 +239,20 @@ static int writeSysfs(const char *path, const char *data) {
  /* --- New function: sweepExpiredEffects ---
       Iterates over all stored effects and clears any that have expired.
  */
-static void sweepExpiredEffects(void) {
-    unsigned long long now = getTimeMs();
-    int usedCount = 0;
-    for (int i = 0; i < MAX_EFFECTS; i++) {
-        if (gEffects[i].used) {
-            usedCount++;
-        }
-    }
-    // only clear expired slots when we've used them all
-    if (usedCount < MAX_EFFECTS)
-        return;
-
-    for (int i = 0; i < MAX_EFFECTS; i++) {
-        if (gEffects[i].used
-            && gEffects[i].ffType != FF_RUMBLE
-            && (now - gEffects[i].startTimeMs >= gEffects[i].durationMs)) {
-            aggregatorClearSlot(&gEffects[i]);
-        }
-    }
-}
+ static void sweepExpiredEffects(void) {
+     unsigned long long now = getTimeMs();
+     for (int i = 0; i < MAX_EFFECTS; i++) {
+         if (gEffects[i].used && (now - gEffects[i].startTimeMs >= gEffects[i].durationMs)) {
+             LOG_FF("[FF] sweepExpiredEffects: Clearing expired effect aggregatorKid=%d\n", gEffects[i].aggregatorKid);
+             aggregatorClearSlot(&gEffects[i]);
+         }
+     }
+ }
  
  /* --- New: Define update_rumble_state ---
       This function sweeps expired effects and updates the PWM or direct FF state.
  */
-static void update_rumble_state(void) {
+ static void update_rumble_state(void) {
      // if we don't yet have a real FF device, nothing to do
      if (!g_hasPhysicalFF || g_ffPhysicalFd < 0)
          return;
@@ -284,56 +270,40 @@ static void update_rumble_state(void) {
              unsigned int mag = gEffects[i].original.u.rumble.weak_magnitude;
              if (mag > maxMag) {
                  maxMag = mag;
-                 effectId = (gEffects[i].realDevId >= 0)
-                                ? gEffects[i].realDevId
-                                : gEffects[i].aggregatorKid;
+                 effectId = (gEffects[i].realDevId >= 0) ? gEffects[i].realDevId : gEffects[i].aggregatorKid;
                  found = 1;
              }
          }
      }
-
      struct input_event ev;
      memset(&ev, 0, sizeof(ev));
      ev.type = EV_FF;
-
      if (!found) {
-         // only clear our last effect, not unrelated ones
-         if (lastEffectId >= 0) {
-             stopPWMThread();
-             ev.code  = lastEffectId;
-             ev.value = 0;
-             if (write(g_ffPhysicalFd, &ev, sizeof(ev)) < 0) {
-                 LOG_FF("[FF] update_rumble_state: write failed: %s\n",
-                        strerror(errno));
-             }
-             lastEffectId = -1;
+         stopPWMThread();
+         ev.code = (effectId >= 0) ? effectId : 0;
+         ev.value = 0;
+         if (write(g_ffPhysicalFd, &ev, sizeof(ev)) < 0) {
+             LOG_FF("[FF] update_rumble_state: write failed: %s\n", strerror(errno));
          }
          return;
      }
-
      if (!g_ffPwmEnabled || maxMag >= g_ffPwmMaxMagnitude) {
          stopPWMThread();
-         ev.code  = effectId;
+         ev.code = effectId;
          ev.value = 1;
          if (write(g_ffPhysicalFd, &ev, sizeof(ev)) < 0) {
-             LOG_FF("[FF] update_rumble_state: write failed: %s\n",
-                    strerror(errno));
+             LOG_FF("[FF] update_rumble_state: write failed: %s\n", strerror(errno));
          }
-         lastEffectId = effectId;
          return;
      }
-
      #define PWM_PERIOD_MS 45
-     unsigned int onDuration  = (maxMag * PWM_PERIOD_MS)
-                                / g_ffPwmMaxMagnitude;
+     unsigned int onDuration = (maxMag * PWM_PERIOD_MS) / g_ffPwmMaxMagnitude;
      unsigned int offDuration = PWM_PERIOD_MS - onDuration;
      setGlobalPWMParameters(onDuration, offDuration, effectId);
      if (!pwmActive) {
          startPWMThread();
      }
-     // record which effect our PWM thread is modulating
-     lastEffectId = effectId;
-}
+ }
  
  /* --- New structure and function: delayedStopThread ---
       If a stop event is received before the effect’s full duration,
@@ -364,7 +334,7 @@ static void update_rumble_state(void) {
  static volatile int ffResyncThreadShouldStop = 0;
  static int ffGrabbed = 0;
  
-static void* ff_resync_thread(void* arg) {
+ static void* ff_resync_thread(void* arg) {
      (void)arg;
      while (!ffResyncThreadShouldStop) {
           update_rumble_state();  // Also sweeps expired effects.
@@ -375,10 +345,6 @@ static void* ff_resync_thread(void* arg) {
                   break;
               }
           }
-          // only consider the device “active” (i.e. keep the grab) when we really
-          // have something playing on it
-          active = (lastEffectId >= 0);
-
           if (g_ffPhysicalFd >= 0) {
               if (active && !ffGrabbed) {
                   if (ioctl(g_ffPhysicalFd, EVIOCGRAB, 1) == 0) {
@@ -391,15 +357,12 @@ static void* ff_resync_thread(void* arg) {
                   if (ioctl(g_ffPhysicalFd, EVIOCGRAB, 0) == 0) {
                        ffGrabbed = 0;
                        LOG_FF("[FF] ff_resync_thread: Exclusive grab released\n");
-                       // only clear our last effect, not generic effect 0
-                       if (lastEffectId >= 0) {
-                           struct input_event off;
-                           memset(&off, 0, sizeof(off));
-                           off.type  = EV_FF;
-                           off.code  = lastEffectId;
-                           off.value = 0;
-                           write(g_ffPhysicalFd, &off, sizeof(off));
-                       }
+                       struct input_event ev;
+                       memset(&ev, 0, sizeof(ev));
+                       ev.type = EV_FF;
+                       ev.code = 0; // fallback code; adjust as needed
+                       ev.value = 0;
+                       write(g_ffPhysicalFd, &ev, sizeof(ev));
                   } else {
                        LOG_FF("[FF] ff_resync_thread: Failed to release grab: %s\n", strerror(errno));
                   }
@@ -408,7 +371,7 @@ static void* ff_resync_thread(void* arg) {
           msleep(100);  // Resync every 100 ms.
      }
      return NULL;
-}
+ }
  
  /* Start the resync thread automatically */
  __attribute__((constructor))
@@ -453,31 +416,17 @@ static void* ff_resync_thread(void* arg) {
      return &gEffects[0];
  }
   
-/* Helper: clear an effect slot *and* free it on the physical device */
-static void aggregatorClearSlot(struct AggregatorEffect* slot) {
-    if (!slot)
-        return;
-
-    // If we had a realDevId on the physical device, free it now:
-    if (slot->realDevId >= 0 && g_hasPhysicalFF && g_ffPhysicalFd >= 0) {
-        if (ioctl(g_ffPhysicalFd, EVIOCRMFF, slot->realDevId) == 0) {
-            LOG_FF("[FF] Freed effect realDevId=%d\n", slot->realDevId);
-        } else {
-            LOG_FF("[FF] Failed to free effect realDevId=%d: %s\n",
-                   slot->realDevId, strerror(errno));
-        }
-    }
-
-    // Now clear all of our internal state for this slot
-    slot->used         = 0;
-    slot->aggregatorKid= -1;
-    slot->realDevId    = -1;
-    slot->shouldStop   = 0;
-    slot->durationMs   = 0;
-    slot->ffType       = 0;
-    slot->startTimeMs  = 0;
-    memset(&slot->original, 0, sizeof(slot->original));
-}
+ static void aggregatorClearSlot(struct AggregatorEffect* slot) {
+     if (!slot) return;
+     slot->used = 0;
+     slot->aggregatorKid = -1;
+     slot->realDevId = -1;
+     slot->shouldStop = 0;
+     slot->durationMs = 0;
+     slot->ffType = 0;
+     slot->startTimeMs = 0;
+     memset(&slot->original, 0, sizeof(slot->original));
+ }
   
  void storeUploadedEffect(struct ff_effect* eff) {
      if (!eff) return;
@@ -552,7 +501,7 @@ static void aggregatorClearSlot(struct AggregatorEffect* slot) {
      return 0;
  }
   
-void ff_play_effect(int aggregatorKid, int doPlay) {
+ void ff_play_effect(int aggregatorKid, int doPlay) {
     LOG_FF("[FF] ff_play_effect: aggregatorKid=%d, doPlay=%d\n", aggregatorKid, doPlay);
     struct AggregatorEffect* slot = aggregatorFindSlotByKid(aggregatorKid);
     if (!slot || !slot->used) {
@@ -610,43 +559,16 @@ void ff_play_effect(int aggregatorKid, int doPlay) {
                 update_rumble_state();
                 LOG_FF("[FF] Starter ping for aggregatorKid=%d\n", aggregatorKid);
             } else {
-                /* STOP — ensure full intended duration before cutting off */
-                unsigned long long now = getTimeMs();
-                unsigned long long elapsed = now - slot->startTimeMs;
-                if (elapsed < slot->durationMs) {
-                    /* schedule delayed stop for remaining time */
-                    unsigned int rem = slot->durationMs - elapsed;
-                    struct DelayedStopArg *dsArg = malloc(sizeof(*dsArg));
-                    if (dsArg) {
-                        dsArg->slot = slot;
-                        dsArg->remainingMs = rem;
-                        pthread_t th;
-                        if (pthread_create(&th, NULL, delayedStopThread, dsArg) == 0) {
-                            pthread_detach(th);
-                            LOG_FF("[FF] Scheduled delayed stop for aggregatorKid=%d in %u ms\n",
-                                   slot->aggregatorKid, rem);
-                        } else {
-                            LOG_FF("[FF] Failed to create delayed stop thread: %s\n", strerror(errno));
-                            /* fallback immediate stop */
-                            struct input_event ev = {0};
-                            ev.type  = EV_FF;
-                            ev.code  = effectId;
-                            ev.value = 0;
-                            write(g_ffPhysicalFd, &ev, sizeof(ev));
-                            aggregatorClearSlot(slot);
-                        }
-                    }
-                } else {
-                    /* duration elapsed: immediate stop */
-                    struct input_event ev = {0};
-                    ev.type  = EV_FF;
-                    ev.code  = effectId;
-                    ev.value = 0;
-                    if (write(g_ffPhysicalFd, &ev, sizeof(ev)) < 0) {
-                        LOG_FF("[FF] ff_play_effect: write off failed: %s\n", strerror(errno));
-                    }
-                    aggregatorClearSlot(slot);
+                /* IMMEDIATE STOP — send an “off” and clear slot */
+                LOG_FF("[FF] Immediate stop for aggregatorKid=%d\n", aggregatorKid);
+                struct input_event ev = {0};
+                ev.type  = EV_FF;
+                ev.code  = effectId;
+                ev.value = 0;
+                if (write(g_ffPhysicalFd, &ev, sizeof(ev)) < 0) {
+                    LOG_FF("[FF] ff_play_effect: write off failed: %s\n", strerror(errno));
                 }
+                aggregatorClearSlot(slot);
             }
             return;
         }
