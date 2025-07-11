@@ -561,6 +561,7 @@ static int writeSysfs(const char *path, const char *data) {
             } else {
                 /* IMMEDIATE STOP — send an “off” and clear slot */
                 LOG_FF("[FF] Immediate stop for aggregatorKid=%d\n", aggregatorKid);
+                stopPWMThread();
                 struct input_event ev = {0};
                 ev.type  = EV_FF;
                 ev.code  = effectId;
