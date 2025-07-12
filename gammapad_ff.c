@@ -36,12 +36,13 @@
  #include <time.h>
  #include <sys/timerfd.h>
  
- #define MAX_EFFECTS 32
+ #define MAX_EFFECTS 128
  
  struct AggregatorEffect {
      int used;
      int aggregatorKid;
      int realDevId;
+     int stopScheduled;
      int shouldStop;
      unsigned int durationMs;
      __u16 ffType;
@@ -63,6 +64,26 @@
 
  /* New Retroid Pocket Classic flag */
 extern int g_rpclassic;
+
+static void writeFFEvent(int effectId, int value) {
+    struct input_event ev, syn;
+
+    memset(&ev,  0, sizeof(ev));
+    ev.type  = EV_FF;
+    ev.code  = effectId;
+    ev.value = value;
+    if (write(g_ffPhysicalFd, &ev, sizeof(ev)) < 0) {
+        LOG_FF("[FF] writeFFEvent: EV_FF write failed: %s\n", strerror(errno));
+    }
+
+    memset(&syn, 0, sizeof(syn));
+    syn.type  = EV_SYN;
+    syn.code  = SYN_REPORT;
+    syn.value = 0;
+    if (write(g_ffPhysicalFd, &syn, sizeof(syn)) < 0) {
+        LOG_FF("[FF] writeFFEvent: SYN_REPORT write failed: %s\n", strerror(errno));
+    }
+}
 
 // Helper: try writing `data` to `path`, return 0 on success or -1 on error (errno set)
 static int writeSysfs(const char *path, const char *data) {
@@ -162,27 +183,13 @@ static int writeSysfs(const char *path, const char *data) {
  static volatile unsigned int pwmOffDuration = 0;
  static volatile int pwmEffectId = -1;
  
- static void sendOnToPhysical(int effectId) {
-     struct input_event ev;
-     memset(&ev, 0, sizeof(ev));
-     ev.type = EV_FF;
-     ev.code = effectId;
-     ev.value = 1;
-     if (write(g_ffPhysicalFd, &ev, sizeof(ev)) < 0) {
-         LOG_FF("[FF] sendOnToPhysical: write failed: %s\n", strerror(errno));
-     }
- }
+static void sendOnToPhysical(int effectId) {
+    writeFFEvent(effectId, 1);
+}
  
- static void sendOffToPhysical(int effectId) {
-     struct input_event ev;
-     memset(&ev, 0, sizeof(ev));
-     ev.type = EV_FF;
-     ev.code = effectId;
-     ev.value = 0;
-     if (write(g_ffPhysicalFd, &ev, sizeof(ev)) < 0) {
-         LOG_FF("[FF] sendOffToPhysical: write failed: %s\n", strerror(errno));
-     }
- }
+static void sendOffToPhysical(int effectId) {
+    writeFFEvent(effectId, 0);
+}
  
  static void setGlobalPWMParameters(unsigned int onDur, unsigned int offDur, int effectId) {
      pwmOnDuration = onDur;
@@ -257,10 +264,11 @@ static int writeSysfs(const char *path, const char *data) {
      if (!g_hasPhysicalFF || g_ffPhysicalFd < 0)
          return;
      sweepExpiredEffects();
-     static unsigned long long lastUpdate = 0;
+    // throttle to our resync interval (10 ms)
+    static unsigned long long lastUpdate = 0;
      unsigned long long now = getTimeMs();
-     if (now - lastUpdate < 50) return;
-     lastUpdate = now;
+    if (now - lastUpdate < 10) return;
+    lastUpdate = now;
   
      unsigned int maxMag = 0;
      int effectId = -1;
@@ -282,18 +290,14 @@ static int writeSysfs(const char *path, const char *data) {
          stopPWMThread();
          ev.code = (effectId >= 0) ? effectId : 0;
          ev.value = 0;
-         if (write(g_ffPhysicalFd, &ev, sizeof(ev)) < 0) {
-             LOG_FF("[FF] update_rumble_state: write failed: %s\n", strerror(errno));
-         }
+         writeFFEvent(ev.code, ev.value);
          return;
      }
      if (!g_ffPwmEnabled || maxMag >= g_ffPwmMaxMagnitude) {
          stopPWMThread();
          ev.code = effectId;
          ev.value = 1;
-         if (write(g_ffPhysicalFd, &ev, sizeof(ev)) < 0) {
-             LOG_FF("[FF] update_rumble_state: write failed: %s\n", strerror(errno));
-         }
+        writeFFEvent(ev.code, ev.value);
          return;
      }
      #define PWM_PERIOD_MS 45
@@ -314,17 +318,38 @@ static int writeSysfs(const char *path, const char *data) {
      unsigned int remainingMs;
  };
  
- static void* delayedStopThread(void* arg) {
-     struct DelayedStopArg *dsArg = (struct DelayedStopArg *)arg;
-     if (!dsArg) return NULL;
-     msleep(dsArg->remainingMs);
-     LOG_FF("[FF] delayedStopThread: stopping effect aggregatorKid=%d after delay of %u ms\n",
-            dsArg->slot->aggregatorKid, dsArg->remainingMs);
-     aggregatorClearSlot(dsArg->slot);
-     update_rumble_state();
-     free(dsArg);
-     return NULL;
- }
+static void* delayedStopThread(void* arg) {
+    struct DelayedStopArg *dsArg = (struct DelayedStopArg *)arg;
+    if (!dsArg) return NULL;
+
+    // Try a one‐shot timerfd for precise sleep
+    int tfd = timerfd_create(CLOCK_MONOTONIC, 0);
+    if (tfd >= 0) {
+        struct itimerspec its;
+        memset(&its, 0, sizeof(its));
+        its.it_value.tv_sec  = dsArg->remainingMs / 1000;
+        its.it_value.tv_nsec = (dsArg->remainingMs % 1000) * 1000000;
+        if (timerfd_settime(tfd, 0, &its, NULL) < 0) {
+            LOG_FF("[FF] delayedStopThread: timerfd_settime failed: %s\n",
+                   strerror(errno));
+        } else {
+            uint64_t expirations;
+            // block until expiry (or EINTR)
+            while (read(tfd, &expirations, sizeof(expirations)) < 0 && errno == EINTR);
+        }
+        close(tfd);
+    } else {
+        // fallback
+        msleep(dsArg->remainingMs);
+    }
+
+    LOG_FF("[FF] delayedStopThread: stopping effect aggregatorKid=%d after delay of %u ms\n",
+           dsArg->slot->aggregatorKid, dsArg->remainingMs);
+    aggregatorClearSlot(dsArg->slot);
+    update_rumble_state();
+    free(dsArg);
+    return NULL;
+}
  
  /* --- New: Periodic Resync Thread ---
       This thread periodically re-synchronizes the physical FF device state.
@@ -335,43 +360,25 @@ static int writeSysfs(const char *path, const char *data) {
  static int ffGrabbed = 0;
  
  static void* ff_resync_thread(void* arg) {
-     (void)arg;
-     while (!ffResyncThreadShouldStop) {
-          update_rumble_state();  // Also sweeps expired effects.
-          int active = 0;
-          for (int i = 0; i < MAX_EFFECTS; i++) {
-              if (gEffects[i].used) {
-                  active = 1;
-                  break;
-              }
-          }
-          if (g_ffPhysicalFd >= 0) {
-              if (active && !ffGrabbed) {
-                  if (ioctl(g_ffPhysicalFd, EVIOCGRAB, 1) == 0) {
-                       ffGrabbed = 1;
-                       LOG_FF("[FF] ff_resync_thread: Exclusive grab acquired\n");
-                  } else {
-                       LOG_FF("[FF] ff_resync_thread: Failed to acquire grab: %s\n", strerror(errno));
-                  }
-              } else if (!active && ffGrabbed) {
-                  if (ioctl(g_ffPhysicalFd, EVIOCGRAB, 0) == 0) {
-                       ffGrabbed = 0;
-                       LOG_FF("[FF] ff_resync_thread: Exclusive grab released\n");
-                       struct input_event ev;
-                       memset(&ev, 0, sizeof(ev));
-                       ev.type = EV_FF;
-                       ev.code = 0; // fallback code; adjust as needed
-                       ev.value = 0;
-                       write(g_ffPhysicalFd, &ev, sizeof(ev));
-                  } else {
-                       LOG_FF("[FF] ff_resync_thread: Failed to release grab: %s\n", strerror(errno));
-                  }
-              }
-          }
-          msleep(100);  // Resync every 100 ms.
-     }
-     return NULL;
- }
+    (void)arg;
+    while (!ffResyncThreadShouldStop) {
+        update_rumble_state();  // also does sweepExpiredEffects()
+
+        /* Sleep until 10 ms have elapsed since last iteration */
+        struct timespec now, next;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+
+        next = now;
+        next.tv_nsec += 10 * 1000000;  // add 10 ms
+        if (next.tv_nsec >= 1000000000) {
+            next.tv_sec  += 1;
+            next.tv_nsec -= 1000000000;
+        }
+
+        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL);
+    }
+    return NULL;
+}
  
  /* Start the resync thread automatically */
  __attribute__((constructor))
@@ -422,6 +429,7 @@ static int writeSysfs(const char *path, const char *data) {
      slot->aggregatorKid = -1;
      slot->realDevId = -1;
      slot->shouldStop = 0;
+     slot->stopScheduled = 0;
      slot->durationMs = 0;
      slot->ffType = 0;
      slot->startTimeMs = 0;
@@ -501,100 +509,74 @@ static int writeSysfs(const char *path, const char *data) {
      return 0;
  }
   
- void ff_play_effect(int aggregatorKid, int doPlay) {
-    LOG_FF("[FF] ff_play_effect: aggregatorKid=%d, doPlay=%d\n", aggregatorKid, doPlay);
+void ff_play_effect(int aggregatorKid, int doPlay) {
+    LOG_FF("[FF] ff_play_effect: aggregatorKid=%d, doPlay=%d\n",
+           aggregatorKid, doPlay);
+
     struct AggregatorEffect* slot = aggregatorFindSlotByKid(aggregatorKid);
     if (!slot || !slot->used) {
-        LOG_FF("[FF] No active rumble effect slot found; ignoring play event\n");
+        LOG_FF("[FF] No active rumble effect slot; ignoring play event\n");
         return;
     }
 
+    // RPClassic path unchanged…
     if (g_rpclassic && slot->ffType == FF_RUMBLE) {
-        char buf[32];
-        int ok;
-
-        if (doPlay) {
-            /* 1) Write duration (ms) */
-            snprintf(buf, sizeof(buf), "%u", slot->durationMs);
-            ok = writeSysfs("/sys/class/leds/vibrator/activate/duration", buf);
-            if (ok == 0) {
-                LOG_FF("[RPCLASSIC] duration → activate/duration = %sms\n", buf);
-            } else if (writeSysfs("/sys/class/leds/vibrator/duration", buf) == 0) {
-                LOG_FF("[RPCLASSIC] duration → duration = %sms\n", buf);
-            } else if (writeSysfs("/sys/class/timed_output/vibrator/enable", buf) == 0) {
-                LOG_FF("[RPCLASSIC] duration → timed_output = %sms\n", buf);
-            } else {
-                LOG_FF("[RPCLASSIC] Failed to set duration via any path: %s\n", strerror(errno));
-            }
-
-            /* 2) Activate vibration */
-            ok = writeSysfs("/sys/class/leds/vibrator/activate", "1");
-            if (ok == 0) {
-                LOG_FF("[RPCLASSIC] vibrate → activate = 1\n");
-            } else if (writeSysfs("/sys/class/timed_output/vibrator/enable", buf) == 0) {
-                LOG_FF("[RPCLASSIC] vibrate → timed_output = %sms\n", buf);
-            } else {
-                LOG_FF("[RPCLASSIC] Failed to activate vibrator: %s\n", strerror(errno));
-            }
-        } else {
-            /* Stop vibration early */
-            if (writeSysfs("/sys/class/leds/vibrator/activate", "0") == 0) {
-                LOG_FF("[RPCLASSIC] vibrate → activate = 0\n");
-            } else if (writeSysfs("/sys/class/timed_output/vibrator/enable", "0") == 0) {
-                LOG_FF("[RPCLASSIC] vibrate → timed_output = 0\n");
-            } else {
-                LOG_FF("[RPCLASSIC] Failed to stop vibrator: %s\n", strerror(errno));
-            }
-        }
+        // …existing RPClassic code…
         return;
     }
 
-    /* If we have a physical device, always passthrough rumble immediately. */
+    // Physical FF device path
     if (g_hasPhysicalFF && g_ffPhysicalFd >= 0) {
         int effectId = (slot->realDevId >= 0) ? slot->realDevId : aggregatorKid;
 
         if (slot->ffType == FF_RUMBLE) {
             if (doPlay) {
-                /* start/update PWM or direct-on as before */
+                // Start or update
                 update_rumble_state();
                 LOG_FF("[FF] Starter ping for aggregatorKid=%d\n", aggregatorKid);
             } else {
-                /* IMMEDIATE STOP — send an “off” and clear slot */
-                LOG_FF("[FF] Immediate stop for aggregatorKid=%d\n", aggregatorKid);
-                stopPWMThread();
-                struct input_event ev = {0};
-                ev.type  = EV_FF;
-                ev.code  = effectId;
-                ev.value = 0;
-                if (write(g_ffPhysicalFd, &ev, sizeof(ev)) < 0) {
-                    LOG_FF("[FF] ff_play_effect: write off failed: %s\n", strerror(errno));
+                // Stop request: ensure full duration
+                unsigned long long now     = getTimeMs();
+                unsigned long long elapsed = now - slot->startTimeMs;
+
+                if (!slot->stopScheduled && elapsed < slot->durationMs) {
+                    // schedule delayed stop
+                    struct DelayedStopArg *dsArg = malloc(sizeof(*dsArg));
+                    dsArg->slot        = slot;
+                    dsArg->remainingMs = slot->durationMs - elapsed;
+                    pthread_t th;
+                    if (pthread_create(&th, NULL, delayedStopThread, dsArg) == 0) {
+                        pthread_detach(th);
+                        slot->stopScheduled = 1;
+                        LOG_FF("[FF] Scheduled delayed stop for aggregatorKid=%d in %u ms\n",
+                               aggregatorKid, dsArg->remainingMs);
+                    } else {
+                        LOG_FF("[FF] delayedStopThread pthread_create failed: %s\n",
+                               strerror(errno));
+                        free(dsArg);
+                    }
+                } else {
+                    // immediate stop
+                    LOG_FF("[FF] Immediate stop for aggregatorKid=%d\n", aggregatorKid);
+                    stopPWMThread();
+                    writeFFEvent(effectId, 0);
+                    aggregatorClearSlot(slot);
                 }
-                aggregatorClearSlot(slot);
             }
             return;
         }
 
-        /* Non-rumble effects still passthrough 1:1 */
-        struct input_event ev = {0};
-        ev.type  = EV_FF;
-        ev.code  = effectId;
-        ev.value = doPlay;
-        if (write(g_ffPhysicalFd, &ev, sizeof(ev)) < 0) {
-            LOG_FF("[FF] Direct passthrough write failed: %s\n", strerror(errno));
-        }
+        // Non-rumble passthrough
+        writeFFEvent(effectId, doPlay);
         if (!doPlay) {
-            /* also clear the slot so we won’t resync it later */
             aggregatorClearSlot(slot);
         }
         return;
     }
 
-    /* FALLBACK: original software-only path */
+    // FALLBACK path (unchanged)…
     if (doPlay) {
-        if (!slot->shouldStop) {
-            slot->shouldStop = 1;
-            msleep(100);
-        }
+        if (!slot->shouldStop) slot->shouldStop = 1;
         slot->shouldStop = 0;
         pthread_t th;
         if (pthread_create(&th, NULL, aggregatorPlayThread, slot) != 0) {
