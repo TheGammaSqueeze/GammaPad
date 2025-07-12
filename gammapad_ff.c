@@ -41,6 +41,7 @@
  struct AggregatorEffect {
      int used;
      int aggregatorKid;
+     int active;
      int realDevId;
      int stopScheduled;
      int shouldStop;
@@ -51,6 +52,7 @@
  };
  
  static struct AggregatorEffect gEffects[MAX_EFFECTS];
+ static int lastEffectId = -1;
  
  /* Forward declaration for aggregatorClearSlot */
  static void aggregatorClearSlot(struct AggregatorEffect* slot);
@@ -273,8 +275,8 @@ static void sendOffToPhysical(int effectId) {
      unsigned int maxMag = 0;
      int effectId = -1;
      int found = 0;
-     for (int i = 0; i < MAX_EFFECTS; i++) {
-         if (gEffects[i].used && gEffects[i].ffType == FF_RUMBLE) {
+    for (int i = 0; i < MAX_EFFECTS; i++) {
+        if (gEffects[i].used && gEffects[i].ffType == FF_RUMBLE && gEffects[i].active) {
              unsigned int mag = gEffects[i].original.u.rumble.weak_magnitude;
              if (mag > maxMag) {
                  maxMag = mag;
@@ -286,18 +288,21 @@ static void sendOffToPhysical(int effectId) {
      struct input_event ev;
      memset(&ev, 0, sizeof(ev));
      ev.type = EV_FF;
-     if (!found) {
-         stopPWMThread();
-         ev.code = (effectId >= 0) ? effectId : 0;
-         ev.value = 0;
-         writeFFEvent(ev.code, ev.value);
-         return;
-     }
+    if (!found) {
+        stopPWMThread();
+        // send a single stop to the last real effect we started
+        if (lastEffectId >= 0) {
+            writeFFEvent(lastEffectId, 0);
+            lastEffectId = -1;
+        }
+        return;
+    }
      if (!g_ffPwmEnabled || maxMag >= g_ffPwmMaxMagnitude) {
          stopPWMThread();
          ev.code = effectId;
          ev.value = 1;
-        writeFFEvent(ev.code, ev.value);
+         writeFFEvent(ev.code, ev.value);
+         lastEffectId = effectId;
          return;
      }
      #define PWM_PERIOD_MS 45
@@ -306,6 +311,7 @@ static void sendOffToPhysical(int effectId) {
      setGlobalPWMParameters(onDuration, offDuration, effectId);
      if (!pwmActive) {
          startPWMThread();
+         lastEffectId = effectId;
      }
  }
  
@@ -528,6 +534,7 @@ void ff_play_effect(int aggregatorKid, int doPlay) {
     // Physical FF device path
     if (g_hasPhysicalFF && g_ffPhysicalFd >= 0) {
         int effectId = (slot->realDevId >= 0) ? slot->realDevId : aggregatorKid;
+        slot->active = doPlay;
 
         if (slot->ffType == FF_RUMBLE) {
             if (doPlay) {
