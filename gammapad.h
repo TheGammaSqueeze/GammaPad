@@ -15,6 +15,7 @@
 #include <ctype.h>
 #include <sys/time.h>
 #include <pthread.h>
+#include "timestamp.h" 
 
 /*
  * If you want more logs, compile with -DGAMMAPAD_VERBOSE_LOGGING=1
@@ -23,11 +24,11 @@
 #define GAMMAPAD_VERBOSE_LOGGING 0
 #endif
 
-/* Logging macro for Force Feedback if verbose logging is enabled. */
 #if GAMMAPAD_VERBOSE_LOGGING
-  #define LOG_FF(fmt, args...) fprintf(stderr, fmt, ## args)
+  /* Force‐Feedback logs now get timestamped */
+  #define LOG_FF(fmt, ...) log_ts(fmt, ##__VA_ARGS__)
 #else
-  #define LOG_FF(fmt, args...) /* no-op */
+  #define LOG_FF(fmt, ...) /* no-op */
 #endif
 
 /*
