@@ -117,6 +117,7 @@ int create_virtual_controller(int* fd_out) {
     /* Core bits */
     ioctl(fd, UI_SET_EVBIT, EV_KEY);
     ioctl(fd, UI_SET_EVBIT, EV_ABS);
+    ioctl(fd, UI_SET_EVBIT, EV_SYN);
     /* mark as a button pad, not a keyboard */
     ioctl(fd, UI_SET_PROPBIT, INPUT_PROP_DIRECT);
     ioctl(fd, UI_SET_PROPBIT, INPUT_PROP_BUTTONPAD);
