@@ -792,9 +792,8 @@ void forward_physical_event(const struct input_event* ev)
         }
 
         /* 1) Forward the KEY event */
-        LOG_FF(stderr,
-                "[FWD] KEY sc=%d => final=%d => val=%d\n",
-                sc, mapped, ev->value);
+        LOG_FF("[FWD] KEY sc=%d => final=%d => val=%d\n",
+               sc, mapped, ev->value);
         struct input_event outKey[2] = {};
         outKey[0].type  = EV_KEY;
         outKey[0].code  = mapped;
@@ -973,9 +972,8 @@ void forward_physical_event(const struct input_event* ev)
 
         /* 4) Normal ABS mapping */
         int mapped = g_absMap[sc];
-        LOG_FF(stderr,
-                "[FWD] ABS sc=%d => final=%d => val=%d\n",
-                sc, mapped, ev_val);
+        LOG_FF("[FWD] ABS sc=%d => final=%d => val=%d\n",
+               sc, mapped, ev_val);
         if (mapped < 0) return;
 
         struct input_event out[2] = {};
