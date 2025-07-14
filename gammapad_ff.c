@@ -56,6 +56,9 @@
  
  /* Forward declaration for aggregatorClearSlot */
  static void aggregatorClearSlot(struct AggregatorEffect* slot);
+
+ // Forward declaration so sweepExpiredEffects can call it
+int dummy_erase_ff_effect(int aggregatorKid);
  
  /* --- Existing code begins --- */
  
@@ -251,10 +254,12 @@ static void sendOffToPhysical(int effectId) {
  static void sweepExpiredEffects(void) {
      unsigned long long now = getTimeMs();
      for (int i = 0; i < MAX_EFFECTS; i++) {
-         if (gEffects[i].used && (now - gEffects[i].startTimeMs >= gEffects[i].durationMs)) {
-             LOG_FF("[FF] sweepExpiredEffects: Clearing expired effect aggregatorKid=%d\n", gEffects[i].aggregatorKid);
-             aggregatorClearSlot(&gEffects[i]);
-         }
+        if (gEffects[i].used && (now - gEffects[i].startTimeMs >= gEffects[i].durationMs)) {
+            int kid = gEffects[i].aggregatorKid;
+            LOG_FF("[FF] sweepExpiredEffects: Erasing expired effect aggregatorKid=%d\n", kid);
+            // This does EVIOCRMFF under the hood, then clears the slot
+            dummy_erase_ff_effect(kid);
+        }
      }
  }
  
@@ -567,7 +572,7 @@ void ff_play_effect(int aggregatorKid, int doPlay) {
                     LOG_FF("[FF] Immediate stop for aggregatorKid=%d\n", aggregatorKid);
                     stopPWMThread();
                     writeFFEvent(effectId, 0);
-                    aggregatorClearSlot(slot);
+                    dummy_erase_ff_effect(aggregatorKid);
                 }
             }
             return;
@@ -576,7 +581,7 @@ void ff_play_effect(int aggregatorKid, int doPlay) {
         // Non-rumble passthrough
         writeFFEvent(effectId, doPlay);
         if (!doPlay) {
-            aggregatorClearSlot(slot);
+            dummy_erase_ff_effect(aggregatorKid);
         }
         return;
     }
