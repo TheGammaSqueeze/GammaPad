@@ -907,9 +907,9 @@ static void* doPollForDevicesThread(void* arg)
          return -1;
      }
      fprintf(stderr, "[GammaPad] Found real FF device '%s'. We'll forward FF to it.\n", path);
-     if(ioctl(fd, EVIOCGRAB, 1) < 0){
-         fprintf(stderr, "[GammaPad] EVIOCGRAB on FF dev '%s' => %s\n", path, strerror(errno));
-     }
+     //if(ioctl(fd, EVIOCGRAB, 1) < 0){
+     //    fprintf(stderr, "[GammaPad] EVIOCGRAB on FF dev '%s' => %s\n", path, strerror(errno));
+     //}
      return fd;
  }
  
