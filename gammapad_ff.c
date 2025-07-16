@@ -64,6 +64,10 @@ static void aggregatorClearSlot(struct AggregatorEffect* slot);
 static void writeFFEvent(int effectId, int value);
 static void stopPWMThread(void);
 
+/* throttle FF writes so Android’s InputReader isn’t flooded */
+static volatile unsigned long long _lastFFWriteTs = 0;
+static void writeFFEventThrottled(int effectId, int value);
+
 /* Arguments passed to the delayed-stop thread */
 struct DelayedStopArg {
     struct AggregatorEffect *slot;
@@ -333,7 +337,7 @@ static void update_rumble_state(void) {
         lastEffectId = effectId;
         return;
     }
-    #define PWM_PERIOD_MS 45
+    #define PWM_PERIOD_MS 8
     unsigned int onDuration = (maxMag * PWM_PERIOD_MS) / g_ffPwmMaxMagnitude;
     unsigned int offDuration = PWM_PERIOD_MS - onDuration;
     setGlobalPWMParameters(onDuration, offDuration, effectId);
@@ -535,6 +539,65 @@ int dummy_erase_ff_effect(int aggregatorKid) {
     return 0;
 }
 
+/* --- RP Classic PWM support added here --- */
+
+#define RPCLASSIC_PWM_PERIOD_MS 8
+
+static pthread_t   rpPwmThread;
+static volatile int rpPwmShouldStop = 0;
+static volatile int rpPwmActive     = 0;
+static volatile unsigned int rpPwmOnDuration  = 0;
+static volatile unsigned int rpPwmOffDuration = 0;
+static volatile unsigned int rpPwmDuration    = 0;
+
+/* Thread: toggles vibrator on/off via sysfs */
+static void* rpPwmThreadFunc(void* arg) {
+    (void)arg;
+    unsigned long long end = getTimeMs() + rpPwmDuration;
+    while (!rpPwmShouldStop && getTimeMs() < end) {
+        /* ON */
+        writeSysfs("/sys/class/leds/vibrator/activate", "1");
+        usleep(rpPwmOnDuration * 1000);
+        if (getTimeMs() >= end || rpPwmShouldStop) break;
+        /* OFF */
+        writeSysfs("/sys/class/leds/vibrator/activate", "0");
+        usleep(rpPwmOffDuration * 1000);
+    }
+    /* ensure off */
+    writeSysfs("/sys/class/leds/vibrator/activate", "0");
+    rpPwmActive = 0;
+    return NULL;
+}
+
+static void startRpPwm(unsigned int durationMs, unsigned int magnitude) {
+    /* stop any existing RP PWM */
+    if (rpPwmActive) {
+        rpPwmShouldStop = 1;
+        pthread_join(rpPwmThread, NULL);
+        rpPwmActive = 0;
+    }
+    /* compute on/off slice */
+    rpPwmOnDuration  = (magnitude * RPCLASSIC_PWM_PERIOD_MS) / g_ffPwmMaxMagnitude;
+    rpPwmOffDuration = RPCLASSIC_PWM_PERIOD_MS - rpPwmOnDuration;
+    rpPwmDuration    = durationMs;
+    rpPwmShouldStop  = 0;
+    if (pthread_create(&rpPwmThread, NULL, rpPwmThreadFunc, NULL) == 0) {
+        rpPwmActive = 1;
+        LOG_FF("[RPCLASSIC] PWM started: dur=%u on=%u off=%u\n",
+               durationMs, rpPwmOnDuration, rpPwmOffDuration);
+    } else {
+        LOG_FF("[RPCLASSIC] PWM thread create failed\n");
+    }
+}
+/* --- end RP Classic PWM additions --- */
+
+static void writeFFEventThrottled(int effectId, int value) {
+    unsigned long long now = getTimeMs();
+    if (now - _lastFFWriteTs < 16) return;
+    _lastFFWriteTs = now;
+    writeFFEvent(effectId, value);
+}
+
 void ff_play_effect(int aggregatorKid, int doPlay) {
     LOG_FF("[FF] ff_play_effect: aggregatorKid=%d, doPlay=%d\n",
            aggregatorKid, doPlay);
@@ -547,41 +610,29 @@ void ff_play_effect(int aggregatorKid, int doPlay) {
 
     // RPClassic path
     if (g_rpclassic && slot->ffType == FF_RUMBLE) {
-        char buf[32];
-        int ok;
+        unsigned int dur = slot->durationMs;
+        unsigned int mag = slot->original.u.rumble.weak_magnitude;
 
         if (doPlay) {
-            /* 1) Write duration (ms) */
-            snprintf(buf, sizeof(buf), "%u", slot->durationMs);
-            ok = writeSysfs("/sys/class/leds/vibrator/activate/duration", buf);
-            if (ok == 0) {
-                LOG_FF("[RPCLASSIC] duration → activate/duration = %sms\n", buf);
-            } else if (writeSysfs("/sys/class/leds/vibrator/duration", buf) == 0) {
-                LOG_FF("[RPCLASSIC] duration → duration = %sms\n", buf);
-            } else if (writeSysfs("/sys/class/timed_output/vibrator/enable", buf) == 0) {
-                LOG_FF("[RPCLASSIC] duration → timed_output = %sms\n", buf);
+            if (!g_ffPwmEnabled || mag >= g_ffPwmMaxMagnitude) {
+                /* one‐shot duration + on */
+                char buf[32];
+                snprintf(buf, sizeof(buf), "%u", dur);
+                writeSysfs("/sys/class/leds/vibrator/duration", buf);
+                writeSysfs("/sys/class/leds/vibrator/activate", "1");
             } else {
-                LOG_FF("[RPCLASSIC] Failed to set duration via any path: %s\n", strerror(errno));
-            }
-
-            /* 2) Activate vibration */
-            ok = writeSysfs("/sys/class/leds/vibrator/activate", "1");
-            if (ok == 0) {
-                LOG_FF("[RPCLASSIC] vibrate → activate = 1\n");
-            } else if (writeSysfs("/sys/class/timed_output/vibrator/enable", buf) == 0) {
-                LOG_FF("[RPCLASSIC] vibrate → timed_output = %sms\n", buf);
-            } else {
-                LOG_FF("[RPCLASSIC] Failed to activate vibrator: %s\n", strerror(errno));
+                /* ramp PWM in software */
+                startRpPwm(dur, mag);
             }
         } else {
-            /* Stop vibration early */
-            if (writeSysfs("/sys/class/leds/vibrator/activate", "0") == 0) {
-                LOG_FF("[RPCLASSIC] vibrate → activate = 0\n");
-            } else if (writeSysfs("/sys/class/timed_output/vibrator/enable", "0") == 0) {
-                LOG_FF("[RPCLASSIC] vibrate → timed_output = 0\n");
-            } else {
-                LOG_FF("[RPCLASSIC] Failed to stop vibrator: %s\n", strerror(errno));
+            /* stop PWM thread if running */
+            if (rpPwmActive) {
+                rpPwmShouldStop = 1;
+                pthread_join(rpPwmThread, NULL);
+                rpPwmActive = 0;
             }
+            /* immediate off */
+            writeSysfs("/sys/class/leds/vibrator/activate", "0");
         }
         return;
     }
