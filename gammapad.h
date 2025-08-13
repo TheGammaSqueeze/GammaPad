@@ -114,4 +114,7 @@ extern int g_uiversion;
 /* Runtime toggle: skip unbind/rebind of the source controller */
 extern int g_noSourceRebind;
 
+/* Runtime toggle: remove the primary /dev/input/event* node after capture */
+extern int g_removeSourceNode;
+
 #endif /* GAMMAPAD_H */

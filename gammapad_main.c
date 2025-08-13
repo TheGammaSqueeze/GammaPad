@@ -74,6 +74,7 @@
  }
  
  int g_noSourceRebind = 0; /* default: perform unbind/rebind */
+ int g_removeSourceNode = 0; /* default: keep source node present */
 
  /* New virtual controller parameters – defaults */
  char* g_uiname = NULL;  // Will be set to default via strdup if not provided
@@ -619,6 +620,9 @@ static void* doPollForDevicesThread(void* arg)
          } else if (!strcmp(argv[i], "--no-source-rebind") || !strcmp(argv[i], "-R")) {
             g_noSourceRebind = 1;
             fprintf(stderr, "CLI: --no-source-rebind active; source controller will not be unbound/rebound\n");
+        } else if (!strcmp(argv[i], "--remove-source-node") || !strcmp(argv[i], "-N")) {
+            g_removeSourceNode = 1;
+            fprintf(stderr, "CLI: --remove-source-node active; primary source /dev/input/event* will be removed after capture\n");
          /* fallthrough to next arg */
          } else {
              if (g_allAggCount < MAX_PHYSICAL_DEVS) {
@@ -815,6 +819,11 @@ static void* doPollForDevicesThread(void* arg)
      );
 
     struct epoll_event events[EPOLL_MAX_EVENTS];
+
+    /* Remove the primary physical node if requested */
+    if (g_removeSourceNode) {
+        removePrimaryPhysicalNode();
+    }
 
     while (!g_shouldExit) {
         checkEventTimeouts();
