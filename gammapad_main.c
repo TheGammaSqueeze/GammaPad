@@ -784,6 +784,11 @@ static void* doPollForDevicesThread(void* arg)
         add_epoll_fd(g_epfd, fd);
     }
 
+    /* Remove the primary physical node if requested */
+    if (g_removeSourceNode) {
+        removePrimaryPhysicalNode();
+    }
+
     /* === NEW: re-open FF device so uinput→physical FF forwarding still works after driver rebind === */
     if (g_ffArg) {
         if (g_ffPhysicalFd >= 0) {
@@ -819,11 +824,6 @@ static void* doPollForDevicesThread(void* arg)
      );
 
     struct epoll_event events[EPOLL_MAX_EVENTS];
-
-    /* Remove the primary physical node if requested */
-    if (g_removeSourceNode) {
-        removePrimaryPhysicalNode();
-    }
 
     while (!g_shouldExit) {
         checkEventTimeouts();

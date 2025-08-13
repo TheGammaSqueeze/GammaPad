@@ -159,6 +159,13 @@ int create_virtual_controller(int* fd_out) {
     enableDiscoveredKeys(fd);
     enableDiscoveredAxes(fd);
 
+    /* If we emulate GAS/BRAKE→L2/R2, ensure BTN_TL2/BTN_TR2 are advertised too */
+    if (g_gas_brake_emulation) {
+        ioctl(fd, UI_SET_KEYBIT, BTN_TL2);
+        ioctl(fd, UI_SET_KEYBIT, BTN_TR2);
+        LOG_FF("create_virtual_controller: emulated BTN_TL2/BTN_TR2 advertised\n");
+    }
+
     /* Advertise every user-mapped destination code */
     for (int sc = 0; sc <= KEY_MAX; sc++) {
         int dst = g_customKeyMap[sc];

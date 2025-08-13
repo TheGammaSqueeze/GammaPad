@@ -986,6 +986,47 @@ void forward_physical_event(const struct input_event* ev)
             }
         }
 
+        /* 3.5) GAS/BRAKE → L2/R2 emulation (axis→button) when no physical L2/R2 exists */
+        if (g_gas_brake_emulation && controllerFd >= 0) {
+            /* We only synthesize if the source does NOT have real L2/R2 keys */
+            static int tl2_down = 0, tr2_down = 0;
+            const int have_l2 = (g_discoveredKeys[BTN_TL2] != 0);
+            const int have_r2 = (g_discoveredKeys[BTN_TR2] != 0);
+
+            /* thresholds computed from physical min/max of the axis */
+            if (sc == ABS_BRAKE && !have_l2) {
+                int mn = getPhysicalAbsMin(ABS_BRAKE);
+                int mx = getPhysicalAbsMax(ABS_BRAKE);
+                int thr_on  = mn + (int)((long long)(mx - mn) * 80 / 100); /* 80% press */
+                int thr_off = mn + (int)((long long)(mx - mn) * 60 / 100); /* 60% release */
+                int want_down = (ev_val >= thr_on) ? 1 : ((ev_val <= thr_off) ? 0 : tl2_down);
+                if (want_down != tl2_down) {
+                    struct input_event k[2] = {};
+                    k[0].type = EV_KEY; k[0].code = BTN_TL2; k[0].value = want_down;
+                    k[1].type = EV_SYN; k[1].code = SYN_REPORT; k[1].value = 0;
+                    write(controllerFd, k, sizeof(k));
+                    tl2_down = want_down;
+                    LOG_FF("[EMU] ABS_BRAKE=%d → BTN_TL2=%d (on=%d%% off=%d%%)\n",
+                           ev_val, tl2_down, 80, 60);
+                }
+            } else if (sc == ABS_GAS && !have_r2) {
+                int mn = getPhysicalAbsMin(ABS_GAS);
+                int mx = getPhysicalAbsMax(ABS_GAS);
+                int thr_on  = mn + (int)((long long)(mx - mn) * 80 / 100); /* 80% press */
+                int thr_off = mn + (int)((long long)(mx - mn) * 60 / 100); /* 60% release */
+                int want_down = (ev_val >= thr_on) ? 1 : ((ev_val <= thr_off) ? 0 : tr2_down);
+                if (want_down != tr2_down) {
+                    struct input_event k[2] = {};
+                    k[0].type = EV_KEY; k[0].code = BTN_TR2; k[0].value = want_down;
+                    k[1].type = EV_SYN; k[1].code = SYN_REPORT; k[1].value = 0;
+                    write(controllerFd, k, sizeof(k));
+                    tr2_down = want_down;
+                    LOG_FF("[EMU] ABS_GAS=%d → BTN_TR2=%d (on=%d%% off=%d%%)\n",
+                           ev_val, tr2_down, 80, 60);
+                }
+            }
+        }
+
         /* 4) Normal ABS mapping */
         int mapped = g_absMap[sc];
         LOG_FF("[FWD] ABS sc=%d => final=%d => val=%d\n",
