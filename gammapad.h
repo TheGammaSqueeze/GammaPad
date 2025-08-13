@@ -111,4 +111,7 @@ extern int g_uivid;
 extern int g_uiproduct;
 extern int g_uiversion;
 
+/* Runtime toggle: skip unbind/rebind of the source controller */
+extern int g_noSourceRebind;
+
 #endif /* GAMMAPAD_H */

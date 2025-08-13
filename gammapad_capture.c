@@ -18,6 +18,7 @@
 #include "gammapad_capture.h"
 #include "gammapad_calibration.h"
 #include "gammapad_config.h"
+#include "gammapad.h"
 #include <sys/epoll.h>
 #include <linux/input.h>
 #include <errno.h>
@@ -239,6 +240,11 @@ static int identifyDriverAndDevice(const char* eventNode,
  */
 void unbindAndRebind(void)
 {
+    if (g_noSourceRebind) {
+        fprintf(stderr,"[GammaPadCapture] --no-source-rebind: skipping unbind/rebind.\n");
+        return;
+    }
+
     if(!gHasDriver){
         fprintf(stderr,"[GammaPadCapture] No valid driver => skip unbind.\n");
         return;
@@ -286,6 +292,11 @@ void unbindAndRebind(void)
  */
 void unbindPrimaryDriver(void)
 {
+    if (g_noSourceRebind) {
+        fprintf(stderr, "[GammaPadCapture] --no-source-rebind: skipping unbindPrimaryDriver.\n");
+        return;
+    }
+
     if (!gHasDriver || !g_driverPath[0] || !g_deviceName[0]) {
         fprintf(stderr, "[GammaPadCapture] unbindPrimaryDriver: no driver info, skipping.\n");
         return;
@@ -312,6 +323,11 @@ void unbindPrimaryDriver(void)
  */
 void bindPrimaryDriver(void)
 {
+    if (g_noSourceRebind) {
+        fprintf(stderr, "[GammaPadCapture] --no-source-rebind: skipping bindPrimaryDriver.\n");
+        return;
+    }
+
     if (!gHasDriver || !g_driverPath[0] || !g_deviceName[0]) {
         fprintf(stderr, "[GammaPadCapture] bindPrimaryDriver: no driver info, skipping.\n");
         return;
@@ -996,6 +1012,11 @@ void forward_physical_event(const struct input_event* ev)
 __attribute__((destructor))
 static void onFinish(void)
 {
+    if (g_noSourceRebind) {
+        fprintf(stderr,"[GammaPadCapture] --no-source-rebind: skipping onFinish unbind/rebind.\n");
+        return;
+    }
+
     fprintf(stderr,"[GammaPadCapture] onFinish() => unbind/rebind x3 for primary device.\n");
     unbindAndRebind();
 }

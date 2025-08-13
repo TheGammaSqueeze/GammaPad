@@ -73,6 +73,8 @@
      g_shouldExit = 1;
  }
  
+ int g_noSourceRebind = 0; /* default: perform unbind/rebind */
+
  /* New virtual controller parameters – defaults */
  char* g_uiname = NULL;  // Will be set to default via strdup if not provided
  int g_uibus = BUS_BLUETOOTH;
@@ -614,6 +616,10 @@ static void* doPollForDevicesThread(void* arg)
              if (g_uiname) free(g_uiname);
              /* FIX: Always strdup the value so that g_uiname is heap allocated */
              g_uiname = strdup(argv[i] + 9);
+         } else if (!strcmp(argv[i], "--no-source-rebind") || !strcmp(argv[i], "-R")) {
+            g_noSourceRebind = 1;
+            fprintf(stderr, "CLI: --no-source-rebind active; source controller will not be unbound/rebound\n");
+         /* fallthrough to next arg */
          } else {
              if (g_allAggCount < MAX_PHYSICAL_DEVS) {
                  g_allAggregatorDevices[g_allAggCount] = argv[i];
