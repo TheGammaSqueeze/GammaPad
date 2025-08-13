@@ -1003,15 +1003,15 @@ void forward_physical_event(const struct input_event* ev)
             }
         }
 
-        /* 3.5) GAS/BRAKE → L2/R2 emulation (axis→button) when no physical L2/R2 exists */
+        /* 3.5) GAS/BRAKE → L2/R2 emulation (axis→button)
+           Always synthesize BTN_TL2/BTN_TR2 when --gasbrakeemulation is set,
+           regardless of whether the source advertises L2/R2. */
         if (g_gas_brake_emulation && controllerFd >= 0) {
-            /* We only synthesize if the source does NOT have real L2/R2 keys */
+            /* Hysteretic press/release derived from ABS_BRAKE/GAS */
             static int tl2_down = 0, tr2_down = 0;
-            const int have_l2 = (g_discoveredKeys[BTN_TL2] != 0);
-            const int have_r2 = (g_discoveredKeys[BTN_TR2] != 0);
 
             /* thresholds computed from physical min/max of the axis */
-            if (sc == ABS_BRAKE && !have_l2) {
+            if (sc == ABS_BRAKE) {
                 int mn = getPhysicalAbsMin(ABS_BRAKE);
                 int mx = getPhysicalAbsMax(ABS_BRAKE);
                 int thr_on  = mn + (int)((long long)(mx - mn) * 80 / 100); /* 80% press */
@@ -1026,7 +1026,7 @@ void forward_physical_event(const struct input_event* ev)
                     LOG_FF("[EMU] ABS_BRAKE=%d → BTN_TL2=%d (on=%d%% off=%d%%)\n",
                            ev_val, tl2_down, 80, 60);
                 }
-            } else if (sc == ABS_GAS && !have_r2) {
+            } else if (sc == ABS_GAS) {
                 int mn = getPhysicalAbsMin(ABS_GAS);
                 int mx = getPhysicalAbsMax(ABS_GAS);
                 int thr_on  = mn + (int)((long long)(mx - mn) * 80 / 100); /* 80% press */
