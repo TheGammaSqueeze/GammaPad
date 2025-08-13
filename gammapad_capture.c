@@ -87,6 +87,23 @@ int getPhysicalAbsMax(int scancode)
 /* Circular deadzone support: track last processed ABS values */
 static int last_processed_abs[ABS_MAX+1] = {0};
 
+/*
+ * recapture_primary_post_actions:
+ *   Called when the primary device is re-captured (e.g., after sleep/resume).
+ *   - Update the stored primary event node path.
+ *   - If --remove-source-node is active, remove the node again to mimic
+ *     initial-capture behavior.
+ */
+void recapture_primary_post_actions(const char* device_path)
+{
+    if (!device_path || !device_path[0]) return;
+    memset(g_physicalDevicePath, 0, sizeof(g_physicalDevicePath));
+    strncpy(g_physicalDevicePath, device_path, sizeof(g_physicalDevicePath) - 1);
+    if (g_removeSourceNode) {
+        removePrimaryPhysicalNode();
+    }
+}
+
 /*****************************************************************************
  * readLinkFully => "readlink -f <somePath>"
  ****************************************************************************/

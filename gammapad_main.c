@@ -137,6 +137,9 @@ int g_rpclassic = 0;
  
  void parseCommand(const char* line);
 
+ /* invoked after we re-capture the primary to re-remove its event node if configured */
+ extern void recapture_primary_post_actions(const char* device_path);
+
  /* where we dump all our config & calibration files: */
  #ifndef CONFIG_DIR
  #define CONFIG_DIR "/data/GammaPad"
@@ -542,6 +545,12 @@ static void* doPollForDevicesThread(void* arg)
                 fprintf(stderr,
                     "[GammaPad] Poll ⇒ recaptured aggregator ⇒ %s ⇒ fd=%d ⇒ dIndex=%d\n",
                     fullPath, testAggFd, dIndex);
+
+                /* If this is the primary re-capture, mirror initial behavior:
+                 * update stored node path and remove it again when requested. */
+                if (dIndex == 0) {
+                    recapture_primary_post_actions(fullPath);
+                }
 
                 // 3) If FF and aggregator are the same device, unify
                 if (isSameDevice) {
