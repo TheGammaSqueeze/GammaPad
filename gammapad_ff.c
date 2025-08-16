@@ -52,6 +52,9 @@ struct AggregatorEffect {
     __u16 ffType;
     unsigned long long startTimeMs;
     struct ff_effect original;
+
+    /* Added: ensure "starter ping" (kick) only fires once per effect start */
+    int starterPingSent;
 };
 
 static struct AggregatorEffect gEffects[MAX_EFFECTS];
@@ -419,6 +422,8 @@ static void ff_resync_init(void) {
 /* Stop the resync thread on unload */
 __attribute__((destructor))
 static void ff_resync_deinit(void) {
+    /* Added: quiesce PWM before tearing down */
+    stopPWMThread();
     ffResyncThreadShouldStop = 1;
     pthread_join(ffResyncThread, NULL);
 }
@@ -464,6 +469,8 @@ static void aggregatorClearSlot(struct AggregatorEffect* slot) {
     slot->ffType = 0;
     slot->startTimeMs = 0;
     memset(&slot->original, 0, sizeof(slot->original));
+    /* Added: reset one-shot starter ping guard */
+    slot->starterPingSent = 0;
 }
 
 void storeUploadedEffect(struct ff_effect* eff) {
@@ -591,7 +598,13 @@ static void startRpPwm(unsigned int durationMs, unsigned int magnitude) {
 }
 /* --- end RP Classic PWM additions --- */
 
+/* Modified: never throttle STOP (value==0). Keep ON throttling available if used elsewhere.
+   Note: PWM path calls writeFFEvent() directly, so cadence/feel is unchanged. */
 static void writeFFEventThrottled(int effectId, int value) {
+    if (value == 0) {
+        writeFFEvent(effectId, 0);
+        return;
+    }
     unsigned long long now = getTimeMs();
     if (now - _lastFFWriteTs < 16) return;
     _lastFFWriteTs = now;
@@ -624,6 +637,13 @@ void ff_play_effect(int aggregatorKid, int doPlay) {
                 /* ramp PWM in software */
                 startRpPwm(dur, mag);
             }
+            /* mark active */
+            slot->active = 1;
+            /* Added: guard to ensure any one-shot "starter ping" fires once per start */
+            if (!slot->starterPingSent) {
+                LOG_FF("[FF] Starter ping for aggregatorKid=%d\n", aggregatorKid);
+                slot->starterPingSent = 1;
+            }
         } else {
             /* stop PWM thread if running */
             if (rpPwmActive) {
@@ -633,6 +653,8 @@ void ff_play_effect(int aggregatorKid, int doPlay) {
             }
             /* immediate off */
             writeSysfs("/sys/class/leds/vibrator/activate", "0");
+            slot->active = 0;
+            slot->starterPingSent = 0; /* allow next start to ping once */
         }
         return;
     }
@@ -645,8 +667,13 @@ void ff_play_effect(int aggregatorKid, int doPlay) {
         if (slot->ffType == FF_RUMBLE) {
             if (doPlay) {
                 // Start or update
-                update_rumble_state();
-                LOG_FF("[FF] Starter ping for aggregatorKid=%d\n", aggregatorKid);
+                /* Added: only issue the one-shot kick once per effect start.
+                   The periodic resync thread will maintain state afterwards. */
+                if (!slot->starterPingSent) {
+                    update_rumble_state();
+                    LOG_FF("[FF] Starter ping for aggregatorKid=%d\n", aggregatorKid);
+                    slot->starterPingSent = 1;
+                }
             } else {
                 // Stop request: ensure full duration
                 unsigned long long now     = getTimeMs();
@@ -675,6 +702,8 @@ void ff_play_effect(int aggregatorKid, int doPlay) {
                     writeFFEvent(effectId, 0);
                     aggregatorClearSlot(slot);
                 }
+                /* reset one-shot guard on stop path */
+                slot->starterPingSent = 0;
             }
             return;
         }
@@ -698,8 +727,16 @@ void ff_play_effect(int aggregatorKid, int doPlay) {
             pthread_detach(th);
             LOG_FF("[FF] spawned play thread for aggregatorKid=%d\n", aggregatorKid);
         }
+        /* mark active and allow a one-shot ping to be recorded */
+        slot->active = 1;
+        if (!slot->starterPingSent) {
+            LOG_FF("[FF] Starter ping for aggregatorKid=%d\n", aggregatorKid);
+            slot->starterPingSent = 1;
+        }
     } else {
         slot->shouldStop = 1;
+        slot->active = 0;
+        slot->starterPingSent = 0;
     }
 }
 
