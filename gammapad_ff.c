@@ -266,6 +266,11 @@ static void* pwmThreadFunc(void* arg) {
 }
 
 static void startPWMThread(void) {
+    /* If either slice is zero, caller should have handled steady state.
+       This guard keeps the loop from emitting degenerate 1/0 bursts. */
+    if (pwmOnDuration == 0 || pwmOffDuration == 0) {
+        return;
+    }
     pwmThreadShouldStop = 0;
     if (pthread_create(&pwmThread, NULL, pwmThreadFunc, NULL) == 0) {
         pwmActive = 1;
@@ -340,9 +345,30 @@ static void update_rumble_state(void) {
         lastEffectId = effectId;
         return;
     }
+    
     #define PWM_PERIOD_MS 8
     unsigned int onDuration = (maxMag * PWM_PERIOD_MS) / g_ffPwmMaxMagnitude;
     unsigned int offDuration = PWM_PERIOD_MS - onDuration;
+
+    /* Edge-case guards: avoid emitting toggle storms when duty is 0% or 100%.
+       This does NOT change feel—these are the mathematically identical end states. */
+    if (onDuration == 0) {
+        /* Duty 0%: ensure steady OFF, no PWM thread. */
+        stopPWMThread();
+        if (lastEffectId >= 0) {
+            writeFFEvent(lastEffectId, 0);
+        }
+        lastEffectId = -1;
+        return;
+    }
+    if (offDuration == 0) {
+        /* Duty 100%: ensure steady ON, no PWM thread. */
+        stopPWMThread();
+        writeFFEvent(effectId, 1);
+        lastEffectId = effectId;
+        return;
+    }
+
     setGlobalPWMParameters(onDuration, offDuration, effectId);
     if (!pwmActive) {
         startPWMThread();
