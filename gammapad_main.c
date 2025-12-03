@@ -28,6 +28,7 @@
  #include <pthread.h>
  #include <limits.h>
  #include <stdlib.h>
+ #include <ctype.h>
  
  #define MAX_ACTIVE_EVENTS 64
  #define EPOLL_MAX_EVENTS  16
@@ -122,6 +123,9 @@ int g_deadzone = 0;
 
 /* Retroid Classic vibrator override: route rumble via sysfs */  
 int g_rpclassic = 0;
+
+/* ABS remapping: src ABS_* -> dst ABS_* (or -1 for no remap) */
+int g_absRemap[ABS_MAX + 1];
 
  /*
   * function prototypes...
@@ -377,6 +381,50 @@ int g_rpclassic = 0;
      epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
      close(fd);
  }
+
+/*
+ * Parse an ABS_* name (or numeric code) into an ABS_XXX constant.
+ * Returns -1 on error.
+ */
+static int parse_abs_name(const char *name)
+{
+    if (!name || !*name)
+        return -1;
+
+    /* Allow numeric (decimal / hex) as a fallback */
+    if (isdigit((unsigned char)name[0])) {
+        long v = strtol(name, NULL, 0);
+        if (v >= 0 && v <= ABS_MAX)
+            return (int)v;
+        return -1;
+    }
+
+    struct AbsNameCode {
+        const char *name;
+        int code;
+    };
+    static const struct AbsNameCode table[] = {
+        { "ABS_X",       ABS_X       },
+        { "ABS_Y",       ABS_Y       },
+        { "ABS_Z",       ABS_Z       },
+        { "ABS_RX",      ABS_RX      },
+        { "ABS_RY",      ABS_RY      },
+        { "ABS_RZ",      ABS_RZ      },
+        { "ABS_THROTTLE",ABS_THROTTLE},
+        { "ABS_RUDDER",  ABS_RUDDER  },
+        { "ABS_WHEEL",   ABS_WHEEL   },
+        { "ABS_GAS",     ABS_GAS     },
+        { "ABS_BRAKE",   ABS_BRAKE   },
+        { "ABS_HAT0X",   ABS_HAT0X   },
+        { "ABS_HAT0Y",   ABS_HAT0Y   },
+    };
+
+    for (size_t i = 0; i < sizeof(table)/sizeof(table[0]); i++) {
+        if (!strcmp(name, table[i].name))
+            return table[i].code;
+    }
+    return -1;
+}
  
  /*
   * maybeResolveDevicePath(): returns a device path.
@@ -593,6 +641,11 @@ static void* doPollForDevicesThread(void* arg)
      if (!g_uiname) {
          g_uiname = strdup("Xbox Wireless Controller");
      }
+
+     /* Default ABS remap table: no remaps */
+     for (int i = 0; i <= ABS_MAX; i++) {
+         g_absRemap[i] = -1;
+     }
  
      for (int i = 1; i < argc; i++) {
          if (!strncmp(argv[i], "--ffdev=", 8)) {
@@ -626,20 +679,71 @@ static void* doPollForDevicesThread(void* arg)
              if (g_uiname) free(g_uiname);
              /* FIX: Always strdup the value so that g_uiname is heap allocated */
              g_uiname = strdup(argv[i] + 9);
+        } else if (!strncmp(argv[i], "--remap-abs=", 12)) {
+            /* Also support: --remap-abs=SRC,DST or --remap-abs=SRC:DST */
+            const char* spec = argv[i] + 12;
+            const char* sep = strpbrk(spec, ",:");
+            if (!sep || sep == spec || *(sep+1) == '\0') {
+                fprintf(stderr, "CLI: --remap-abs=<SRC,DST> expects two ABS names separated by , or :\n");
+            } else {
+                char srcBuf[32];
+                char dstBuf[32];
+                size_t leftLen = (size_t)(sep - spec);
+                if (leftLen >= sizeof(srcBuf)) leftLen = sizeof(srcBuf) - 1;
+                memcpy(srcBuf, spec, leftLen); srcBuf[leftLen] = '\0';
+                strncpy(dstBuf, sep + 1, sizeof(dstBuf) - 1);
+                dstBuf[sizeof(dstBuf) - 1] = '\0';
+                int src = parse_abs_name(srcBuf);
+                int dst = parse_abs_name(dstBuf);
+                if (src < 0 || dst < 0) {
+                    fprintf(stderr, "CLI: --remap-abs invalid ABS name(s): '%s' '%s'\n", srcBuf, dstBuf);
+                } else {
+                    g_absRemap[src] = dst;
+                    fprintf(stderr, "CLI: remap ABS %s(%d) -> %s(%d)\n", srcBuf, src, dstBuf, dst);
+                }
+            }
+        } else if (!strcmp(argv[i], "--remap-abs")) {
+            /* Usage: --remap-abs SRC DST
+             * Example: --remap-abs ABS_RX ABS_Z
+             * meaning: take values from ABS_RX (virtual) and emit them on ABS_Z.
+             *
+             * Multiple --remap-abs options are allowed.
+             */
+            if (i + 2 >= argc) {
+                fprintf(stderr,
+                        "CLI: --remap-abs requires two arguments, e.g. --remap-abs ABS_RX ABS_Z\n");
+            } else {
+                const char *srcName = argv[i + 1];
+                const char *dstName = argv[i + 2];
+                int src = parse_abs_name(srcName);
+                int dst = parse_abs_name(dstName);
+                if (src < 0 || dst < 0) {
+                    fprintf(stderr,
+                            "CLI: --remap-abs invalid ABS name(s): '%s' '%s'\n",
+                            srcName, dstName);
+                } else {
+                    g_absRemap[src] = dst;
+                    fprintf(stderr, "CLI: remap ABS %s(%d) -> %s(%d)\n",
+                            srcName, src, dstName, dst);
+                }
+                i += 2; /* skip SRC and DST */
+            }
          } else if (!strcmp(argv[i], "--no-source-rebind") || !strcmp(argv[i], "-R")) {
             g_noSourceRebind = 1;
             fprintf(stderr, "CLI: --no-source-rebind active; source controller will not be unbound/rebound\n");
         } else if (!strcmp(argv[i], "--remove-source-node") || !strcmp(argv[i], "-N")) {
             g_removeSourceNode = 1;
             fprintf(stderr, "CLI: --remove-source-node active; primary source /dev/input/event* will be removed after capture\n");
-         /* fallthrough to next arg */
-         } else {
-             if (g_allAggCount < MAX_PHYSICAL_DEVS) {
-                 g_allAggregatorDevices[g_allAggCount] = argv[i];
-                 g_allAggCount++;
-             }
-         }
-     }
+        } else {
+            /* Treat unknown switches as errors, do not enqueue as aggregator devices */
+            if (argv[i][0] == '-') {
+                fprintf(stderr, "CLI: unknown option '%s' ignored\n", argv[i]);
+            } else if (g_allAggCount < MAX_PHYSICAL_DEVS) {
+                g_allAggregatorDevices[g_allAggCount] = argv[i];
+                g_allAggCount++;
+            }
+        }
+    }
  
     if (g_ffArg) {
         // Resolve once at startup and keep it around for reconnection detection

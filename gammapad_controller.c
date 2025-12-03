@@ -26,10 +26,16 @@ extern int g_keyMap[KEY_MAX+1];
 extern int g_absMap[ABS_MAX+1];
 extern int getPhysicalAbsMin(int scancode);
 extern int getPhysicalAbsMax(int scancode);
+extern int getPhysicalAbsFuzz(int scancode);
+extern int getPhysicalAbsFlat(int scancode);
+extern int getPhysicalAbsResolution(int scancode);
 extern int g_customKeyMap[KEY_MAX + 1];
 
 /* We'll read from g_physicalFd if it's open. (legacy leftover) */
 extern int g_physicalFd;
+
+/* ABS remap table from CLI (defined in gammapad_main.c) */
+extern int g_absRemap[ABS_MAX + 1];
 
 /*
  * setAbsRange => fallback approach if axis wasn't discovered
@@ -84,12 +90,19 @@ static void enableDiscoveredAxes(int fd)
     for (int sc = 0; sc <= ABS_MAX; sc++){
         if (g_discoveredAxes[sc]){
             int finalAxis = g_absMap[sc];
-            if (ioctl(fd, UI_SET_ABSBIT, finalAxis) < 0){
+            int outAxis   = finalAxis;
+            /* Apply CLI remap at capability level as well */
+            if (finalAxis >= 0 && finalAxis <= ABS_MAX &&
+                g_absRemap[finalAxis] >= 0) {
+                outAxis = g_absRemap[finalAxis];
+            }
+
+            if (ioctl(fd, UI_SET_ABSBIT, outAxis) < 0){
                 LOG_FF("enableDiscoveredAxes: UI_SET_ABSBIT(%d) => %s\n",
-                       finalAxis, strerror(errno));
+                       outAxis, strerror(errno));
             } else {
-                LOG_FF("enableDiscoveredAxes: scancode=%d => finalAxis=%d\n",
-                       sc, finalAxis);
+                LOG_FF("enableDiscoveredAxes: scancode=%d => finalAxis=%d => outAxis=%d\n",
+                       sc, finalAxis, outAxis);
                 countFound++;
             }
         }
@@ -211,16 +224,56 @@ int create_virtual_controller(int* fd_out) {
     setAbsRange(&uidev, ABS_HAT0X,    -1,    1);
     setAbsRange(&uidev, ABS_HAT0Y,    -1,    1);
 
+    /*
+     * Precompute which axes are *destinations* of a remap.
+     * Example: --remap-abs ABS_RY ABS_RZ
+     *   => g_absRemap[ABS_RY] = ABS_RZ
+     *   => remapDest[ABS_RZ] = 1
+     *
+     * Later, when we see the physical ABS_RZ scancode, we will
+     * skip writing its own range so it does not overwrite the
+     * range we copied from ABS_RY.
+     */
+    int remapDest[ABS_MAX + 1];
+    memset(remapDest, 0, sizeof(remapDest));
+    for (int src = 0; src <= ABS_MAX; ++src) {
+        int dst = g_absRemap[src];
+        if (dst >= 0 && dst <= ABS_MAX) {
+            remapDest[dst] = 1;
+        }
+    }
+ 
     /* override with real min/max */
     for (int sc = 0; sc <= ABS_MAX; sc++) {
         if (g_discoveredAxes[sc]) {
             int axis = g_absMap[sc];
+
+            if (axis < 0 || axis > ABS_MAX)
+                continue;
+
+            int outAxis = axis;
+            if (g_absRemap[axis] >= 0 && g_absRemap[axis] <= ABS_MAX) {
+                /* axis is a remap *source*: write its range onto the destination */
+                outAxis = g_absRemap[axis];
+            } else if (remapDest[axis]) {
+                /* axis is only a remap *destination*: its range is provided by its source */
+                continue;
+            }
+
             int mn   = getPhysicalAbsMin(sc);
             int mx   = getPhysicalAbsMax(sc);
-            uidev.absmin[axis] = mn;
-            uidev.absmax[axis] = mx;
-            LOG_FF("create_virtual_controller: sc=%d→axis=%d→[%d..%d]\n",
-                   sc, axis, mn, mx);
+            int fuzz = getPhysicalAbsFuzz(sc);
+            int flat = getPhysicalAbsFlat(sc);
+            /* Resolution is tracked but uinput_user_dev has no absres field
+             * in many kernels, so we do not set it here. */
+
+            uidev.absmin[outAxis]  = mn;
+            uidev.absmax[outAxis]  = mx;
+            uidev.absfuzz[outAxis] = fuzz;
+            uidev.absflat[outAxis] = flat;
+
+            LOG_FF("create_virtual_controller: sc=%d→axis=%d→outAxis=%d→[%d..%d] fuzz=%d flat=%d\n",
+                   sc, axis, outAxis, mn, mx, fuzz, flat);
         }
     }
 

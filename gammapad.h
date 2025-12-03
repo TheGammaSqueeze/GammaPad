@@ -6,6 +6,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <linux/input.h>
 #include <linux/uinput.h>
 #include <sys/stat.h>
 #include <errno.h>
@@ -101,6 +102,9 @@ extern int g_deadzone;
 
 /* New: Retroid Pocket Classic vibrator mode */  
 extern int g_rpclassic;
+
+/* ABS remapping: index = source ABS_* code, value = destination ABS_* code or -1 for no remap */
+extern int g_absRemap[ABS_MAX + 1];
 
 /*
  * New virtual controller parameters (set via command-line):

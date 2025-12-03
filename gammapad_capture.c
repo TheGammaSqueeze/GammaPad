@@ -49,6 +49,9 @@ int g_discoveredKeys[KEY_MAX+1];
 int g_discoveredAxes[ABS_MAX+1];
 static int g_physicalAbsMin[ABS_MAX+1];
 static int g_physicalAbsMax[ABS_MAX+1];
+static int g_physicalAbsFuzz[ABS_MAX+1];
+static int g_physicalAbsFlat[ABS_MAX+1];
+static int g_physicalAbsRes[ABS_MAX+1];
 
 /*
  * scancode => final code if .kl says so; fallback => same scancode if not mapped.
@@ -82,6 +85,24 @@ int getPhysicalAbsMax(int scancode)
 {
     if (scancode < 0 || scancode > ABS_MAX) return 32767;
     return g_physicalAbsMax[scancode];
+}
+
+int getPhysicalAbsFuzz(int scancode)
+{
+    if (scancode < 0 || scancode > ABS_MAX) return 0;
+    return g_physicalAbsFuzz[scancode];
+}
+
+int getPhysicalAbsFlat(int scancode)
+{
+    if (scancode < 0 || scancode > ABS_MAX) return 0;
+    return g_physicalAbsFlat[scancode];
+}
+
+int getPhysicalAbsResolution(int scancode)
+{
+    if (scancode < 0 || scancode > ABS_MAX) return 0;
+    return g_physicalAbsRes[scancode];
 }
 
 /* Circular deadzone support: track last processed ABS values */
@@ -463,13 +484,19 @@ static void mergeKeysIntoGlobal(const int inKeys[KEY_MAX+1], int isPrimary)
  */
 static void mergeAxesIntoGlobal(const int inAxes[ABS_MAX+1],
                                 const int inMin[ABS_MAX+1],
-                                const int inMax[ABS_MAX+1])
+                                const int inMax[ABS_MAX+1],
+                                const int inFuzz[ABS_MAX+1],
+                                const int inFlat[ABS_MAX+1],
+                                const int inRes[ABS_MAX+1])
 {
     for(int sc=0; sc<=ABS_MAX; sc++){
         if(inAxes[sc]){
             g_discoveredAxes[sc]=1;
             g_physicalAbsMin[sc]= inMin[sc];
             g_physicalAbsMax[sc]= inMax[sc];
+            g_physicalAbsFuzz[sc]= inFuzz[sc];
+            g_physicalAbsFlat[sc]= inFlat[sc];
+            g_physicalAbsRes[sc] = inRes[sc];
         }
     }
 }
@@ -504,7 +531,10 @@ static void discoverSingleDeviceKeys(int fd, int outKeys[KEY_MAX+1])
 static void discoverSingleDeviceAxes(int fd,
                                      int outAxes[ABS_MAX+1],
                                      int outMin[ABS_MAX+1],
-                                     int outMax[ABS_MAX+1])
+                                     int outMax[ABS_MAX+1],
+                                     int outFuzz[ABS_MAX+1],
+                                     int outFlat[ABS_MAX+1],
+                                     int outRes[ABS_MAX+1])
 {
     unsigned long absBits[(ABS_MAX+1)/(8*sizeof(long))];
     memset(absBits,0,sizeof(absBits));
@@ -513,6 +543,9 @@ static void discoverSingleDeviceAxes(int fd,
     for(int i=0; i<=ABS_MAX;i++){
         outMin[i]= -32768;
         outMax[i]=  32767;
+        outFuzz[i]= 0;
+        outFlat[i]= 0;
+        outRes[i] = 0;
     }
 
     if(ioctl(fd, EVIOCGBIT(EV_ABS, sizeof(absBits)), absBits)<0){
@@ -529,6 +562,9 @@ static void discoverSingleDeviceAxes(int fd,
             if(ioctl(fd, EVIOCGABS(code), &info)==0){
                 outMin[code]= info.minimum;
                 outMax[code]= info.maximum;
+                outFuzz[code]= info.fuzz;
+                outFlat[code]= info.flat;
+                outRes[code] = info.resolution;
                 fprintf(stderr,"[GammaPadCapture] singleDeviceAxes => sc=%d => min=%d, max=%d\n",
                         code, info.minimum, info.maximum);
             }
@@ -554,12 +590,20 @@ void discoverAxes(int fd)
     int singleAxes[ABS_MAX+1];
     int singleMin[ABS_MAX+1];
     int singleMax[ABS_MAX+1];
+    int singleFuzz[ABS_MAX+1];
+    int singleFlat[ABS_MAX+1];
+    int singleRes[ABS_MAX+1];
     memset(singleAxes,0,sizeof(singleAxes));
     memset(singleMin,0,sizeof(singleMin));
     memset(singleMax,0,sizeof(singleMax));
+    memset(singleFuzz,0,sizeof(singleFuzz));
+    memset(singleFlat,0,sizeof(singleFlat));
+    memset(singleRes,0,sizeof(singleRes));
 
-    discoverSingleDeviceAxes(fd, singleAxes, singleMin, singleMax);
-    mergeAxesIntoGlobal(singleAxes, singleMin, singleMax);
+    discoverSingleDeviceAxes(fd, singleAxes, singleMin, singleMax,
+                             singleFuzz, singleFlat, singleRes);
+    mergeAxesIntoGlobal(singleAxes, singleMin, singleMax,
+                        singleFuzz, singleFlat, singleRes);
 }
 
 /*
@@ -1044,15 +1088,25 @@ void forward_physical_event(const struct input_event* ev)
             }
         }
 
-        /* 4) Normal ABS mapping */
+        /* 4) Normal ABS mapping + optional CLI remap
+         *
+         * g_absMap[sc]       => "final" axis derived from .kl / discovery
+         * g_absRemap[final]  => optional CLI remap final->destination
+         *
+         * Example: --remap-abs ABS_RX ABS_Z
+         *   values that would normally go to ABS_RX are instead reported on ABS_Z.
+         */
         int mapped = g_absMap[sc];
-        LOG_FF("[FWD] ABS sc=%d => final=%d => val=%d\n",
-               sc, mapped, ev_val);
         if (mapped < 0) return;
+        int outAxis = mapped;
+        if (mapped >= 0 && mapped <= ABS_MAX && g_absRemap[mapped] >= 0)
+            outAxis = g_absRemap[mapped];
+        LOG_FF("[FWD] ABS sc=%d => final=%d => outAxis=%d => val=%d\n",
+               sc, mapped, outAxis, ev_val);
 
         struct input_event out[2] = {};
         out[0].type  = EV_ABS;
-        out[0].code  = mapped;
+        out[0].code  = outAxis;
         out[0].value = ev_val;
         out[1].type  = EV_SYN;
         out[1].code  = SYN_REPORT;
