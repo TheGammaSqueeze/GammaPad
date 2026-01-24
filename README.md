@@ -94,3 +94,36 @@ Added smart bind/unbind logic:
 
 ## Why This Works
 At boot, the device is already bound by the system. The fix detects this and skips the unnecessary rebind, avoiding the kernel driver bug entirely.
+
+------
+
+# Dual Controller Support (Mantis Compatibility)
+
+## Problem
+Some apps (like Mantis Gamepad Pro) don't recognize controllers that have `INPUT_PROP_DIRECT` set or have force feedback enabled. However, other programs require the controller to appear as a Bluetooth Xbox controller with FF support.
+
+## Solution
+GammaPad now creates **two virtual controllers**:
+
+1. **Main Controller** - Full-featured Xbox Bluetooth controller
+   - Bus: `BUS_BLUETOOTH` (0x05)
+   - VID: `0x045e` (Microsoft)
+   - PID: `0x02fd` (Xbox Wireless Controller)
+   - Has `INPUT_PROP_DIRECT`, `INPUT_PROP_BUTTONPAD`, `INPUT_PROP_TOPBUTTONPAD`
+   - Full force feedback support
+   - Used by most games and programs expecting an Xbox controller
+
+2. **Mantis Controller** - Simplified controller for Mantis compatibility
+   - Bus: `BUS_USB` (0x03)
+   - VID: `0x045e` (Microsoft)
+   - PID: `0x02fe` (different from main)
+   - No `INPUT_PROP_DIRECT`
+   - No force feedback
+   - Name has "(Mantis)" suffix
+   - Used by Mantis and similar apps that need a simpler controller profile
+
+## Why Different Identifiers?
+The Mantis controller uses `BUS_USB` and a different product ID (`0x02fe`) to prevent programs from confusing the two controllers. If both had identical VID/PID/bus, programs looking for a Bluetooth Xbox controller might pick up the Mantis one instead, causing compatibility issues.
+
+## Events
+Both controllers receive the same input events, so either can be used depending on which one the application detects.

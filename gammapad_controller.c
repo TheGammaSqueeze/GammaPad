@@ -172,13 +172,6 @@ int create_virtual_controller(int* fd_out) {
     enableDiscoveredKeys(fd);
     enableDiscoveredAxes(fd);
 
-    /* Always advertise BTN_GAMEPAD and core gamepad buttons for Xbox compatibility */
-    ioctl(fd, UI_SET_KEYBIT, BTN_GAMEPAD);
-    ioctl(fd, UI_SET_KEYBIT, BTN_A);
-    ioctl(fd, UI_SET_KEYBIT, BTN_B);
-    ioctl(fd, UI_SET_KEYBIT, BTN_X);
-    ioctl(fd, UI_SET_KEYBIT, BTN_Y);
-
     /* If we emulate GAS/BRAKE→L2/R2, ensure BTN_TL2/BTN_TR2 are advertised too */
     if (g_gas_brake_emulation) {
         ioctl(fd, UI_SET_KEYBIT, BTN_TL2);
@@ -345,9 +338,10 @@ int create_mantis_controller(int* fd_out) {
     struct uinput_user_dev uidev;
     memset(&uidev, 0, sizeof(uidev));
     snprintf(uidev.name, UINPUT_MAX_NAME_SIZE, "%s (Mantis)", g_uiname);
-    uidev.id.bustype = g_uibus;
+    /* Use USB bus and different product ID to avoid conflicting with main Bluetooth Xbox controller */
+    uidev.id.bustype = BUS_USB;
     uidev.id.vendor  = g_uivid;
-    uidev.id.product = g_uiproduct;
+    uidev.id.product = 0x02fe;  /* Different from main controller's 0x02fd */
     uidev.id.version = g_uiversion;
     /* No FF for Mantis controller */
     uidev.ff_effects_max = 0;
