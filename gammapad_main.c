@@ -76,7 +76,7 @@
      g_shouldExit = 1;
  }
  
- int g_noSourceRebind = 0; /* default: perform unbind/rebind */
+ int g_noSourceRebind = 1; /* default: skip unbind/rebind (avoids sysfs conflicts) */
  int g_removeSourceNode = 0; /* default: keep source node present */
 
  /* New virtual controller parameters – defaults */
@@ -736,7 +736,10 @@ static void* doPollForDevicesThread(void* arg)
             }
          } else if (!strcmp(argv[i], "--no-source-rebind") || !strcmp(argv[i], "-R")) {
             g_noSourceRebind = 1;
-            fprintf(stderr, "CLI: --no-source-rebind active; source controller will not be unbound/rebound\n");
+            fprintf(stderr, "CLI: --no-source-rebind active (default); source controller will not be unbound/rebound\n");
+        } else if (!strcmp(argv[i], "--source-rebind")) {
+            g_noSourceRebind = 0;
+            fprintf(stderr, "CLI: --source-rebind active; source controller WILL be unbound/rebound\n");
         } else if (!strcmp(argv[i], "--remove-source-node") || !strcmp(argv[i], "-N")) {
             g_removeSourceNode = 1;
             fprintf(stderr, "CLI: --remove-source-node active; primary source /dev/input/event* will be removed after capture\n");
@@ -862,8 +865,11 @@ static void* doPollForDevicesThread(void* arg)
      }
 
      pthread_t pollThread;
+     int pollThreadCreated = 0;
      if (pthread_create(&pollThread, NULL, doPollForDevicesThread, NULL) != 0) {
          fprintf(stderr, "[GammaPad] Could not create poll thread => no re-capture logic.\n");
+     } else {
+         pollThreadCreated = 1;
      }
 
     //
@@ -1006,7 +1012,9 @@ static void* doPollForDevicesThread(void* arg)
 
      close(g_epfd);
      g_shouldExit = 1;
-     pthread_join(pollThread, NULL);
+     if (pollThreadCreated) {
+         pthread_join(pollThread, NULL);
+     }
      for(int i = 0; i < g_physCount; i++){
          if(g_physFds[i] >= 0){
              ioctl(g_physFds[i], EVIOCGRAB, 0);
