@@ -55,3 +55,75 @@ Android Props for Configuration: GammaPad relies on Android property-based confi
 - Readability & Documentation:
   - We have consolidated some large blocks of code and documented the major flows.
   - Ongoing improvements are happening to ensure maintainers can easily see how each module interacts.
+
+------
+
+# Boot Crash Fix (spi_joytick kernel driver workaround)
+
+## Problem
+GammaPad was crashing at boot with error:
+```
+sysfs: cannot create duplicate filename '/devices/platform/singleadc-joypad/poll_interval'
+singleadc-joypad: create sysfs group fail, error: -17
+probe of singleadc-joypad failed with error -17
+```
+
+## Root Cause
+The `spi_joytick` kernel driver has a bug where it doesn't properly clean up sysfs entries (`poll_interval`, etc.) when the device is unbound. When GammaPad called `bindPrimaryDriver()` after unbind, the kernel's `joypad_probe()` function would fail with `-EEXIST` because the sysfs attributes already existed.
+
+The old code made this worse by attempting bind 3 times, triggering the error repeatedly.
+
+## Solution (in gammapad_capture.c)
+
+Added smart bind/unbind logic:
+
+1. **New function `isDeviceBound()`**: Checks if device is currently bound by looking for `<driverPath>/<deviceName>` in sysfs.
+
+2. **Modified `unbindPrimaryDriver()`**:
+   - Only unbinds if device is actually bound
+   - Single attempt instead of 3x
+   - Increased delay from 1s to 2s for kernel cleanup
+
+3. **Modified `bindPrimaryDriver()`**:
+   - Checks if device is already bound before attempting bind
+   - If already bound, skips bind entirely (avoids the kernel bug)
+   - Single attempt instead of 3x
+   - Verifies bind succeeded
+
+4. **Modified `unbindAndRebind()`**: Uses same smart logic for exit cleanup.
+
+## Why This Works
+At boot, the device is already bound by the system. The fix detects this and skips the unnecessary rebind, avoiding the kernel driver bug entirely.
+
+------
+
+# Dual Controller Support (Mantis Compatibility)
+
+## Problem
+Some apps (like Mantis Gamepad Pro) don't recognize controllers that have `INPUT_PROP_DIRECT` set or have force feedback enabled. However, other programs require the controller to appear as a Bluetooth Xbox controller with FF support.
+
+## Solution
+GammaPad now creates **two virtual controllers**:
+
+1. **Main Controller** - Full-featured Xbox Bluetooth controller
+   - Bus: `BUS_BLUETOOTH` (0x05)
+   - VID: `0x045e` (Microsoft)
+   - PID: `0x02fd` (Xbox Wireless Controller)
+   - Has `INPUT_PROP_DIRECT`, `INPUT_PROP_BUTTONPAD`, `INPUT_PROP_TOPBUTTONPAD`
+   - Full force feedback support
+   - Used by most games and programs expecting an Xbox controller
+
+2. **Mantis Controller** - Simplified controller for Mantis compatibility
+   - Bus: `BUS_USB` (0x03)
+   - VID: `0x045e` (Microsoft)
+   - PID: `0x02fe` (different from main)
+   - No `INPUT_PROP_DIRECT`
+   - No force feedback
+   - Name has "(Mantis)" suffix
+   - Used by Mantis and similar apps that need a simpler controller profile
+
+## Why Different Identifiers?
+The Mantis controller uses `BUS_USB` and a different product ID (`0x02fe`) to prevent programs from confusing the two controllers. If both had identical VID/PID/bus, programs looking for a Bluetooth Xbox controller might pick up the Mantis one instead, causing compatibility issues.
+
+## Events
+Both controllers receive the same input events, so either can be used depending on which one the application detects.

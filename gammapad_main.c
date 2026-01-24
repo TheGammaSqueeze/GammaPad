@@ -50,13 +50,15 @@
  
  /*
   * Global FDs:
-  *  - controllerFd: virtual gamepad FD
+  *  - controllerFd: virtual gamepad FD (Xbox-style with INPUT_PROP_DIRECT)
+  *  - mantisControllerFd: virtual gamepad FD (Mantis-compatible, no INPUT_PROP_DIRECT)
   *  - mouseFd: virtual mouse FD
   *  - g_physicalFd: legacy physical device FD
   *  - g_physFds: aggregator physical device FDs
   *  - g_ffPhysicalFd: physical force feedback device FD
   */
  int controllerFd = -1;
+ int mantisControllerFd = -1;
  int mouseFd = -1;
  int g_physicalFd = -1;
  
@@ -74,7 +76,7 @@
      g_shouldExit = 1;
  }
  
- int g_noSourceRebind = 0; /* default: perform unbind/rebind */
+ int g_noSourceRebind = 1; /* default: skip unbind/rebind (avoids sysfs conflicts) */
  int g_removeSourceNode = 0; /* default: keep source node present */
 
  /* New virtual controller parameters – defaults */
@@ -118,6 +120,7 @@ int g_analog_sensitivity = 0;
 /* emulate GAS/BRAKE from buttons L2/R2 */
 int g_gas_brake_emulation  = 0;
 
+
 /* configurable deadzone percentage (0…100) */
 int g_deadzone = 0;
 
@@ -131,6 +134,7 @@ int g_absRemap[ABS_MAX + 1];
   * function prototypes...
   */
  int create_virtual_controller(int* fd_out);
+ int create_mantis_controller(int* fd_out);
  int create_virtual_mouse(int* fd_out);
  void destroy_virtual_device(int fd);
  
@@ -186,23 +190,24 @@ int g_absRemap[ABS_MAX + 1];
      ev[1].code = SYN_REPORT;
      ev[1].value = 0;
      write(controllerFd, &ev, sizeof(ev));
+     if(mantisControllerFd >= 0) write(mantisControllerFd, &ev, sizeof(ev));
  }
- 
+
  void scheduleEvent(int code, int isKey, int value, unsigned long long durationMs)
  {
      sendEvent(code, (isKey ? EVENT_TYPE_KEY : EVENT_TYPE_ABS), value, durationMs);
  }
- 
+
  /*
   * resetEvent(): auto-release for short-press events.
   */
  static void resetEvent(int code, enum EventType t)
  {
      if(controllerFd < 0) return;
-     
+
      struct input_event ev[2];
      memset(ev, 0, sizeof(ev));
-     
+
      if(t == EVENT_TYPE_KEY){
          ev[0].type = EV_KEY;
          ev[0].code = code;
@@ -216,6 +221,7 @@ int g_absRemap[ABS_MAX + 1];
      ev[1].code = SYN_REPORT;
      ev[1].value = 0;
      write(controllerFd, &ev, sizeof(ev));
+     if(mantisControllerFd >= 0) write(mantisControllerFd, &ev, sizeof(ev));
  }
  
  /*
@@ -730,7 +736,10 @@ static void* doPollForDevicesThread(void* arg)
             }
          } else if (!strcmp(argv[i], "--no-source-rebind") || !strcmp(argv[i], "-R")) {
             g_noSourceRebind = 1;
-            fprintf(stderr, "CLI: --no-source-rebind active; source controller will not be unbound/rebound\n");
+            fprintf(stderr, "CLI: --no-source-rebind active (default); source controller will not be unbound/rebound\n");
+        } else if (!strcmp(argv[i], "--source-rebind")) {
+            g_noSourceRebind = 0;
+            fprintf(stderr, "CLI: --source-rebind active; source controller WILL be unbound/rebound\n");
         } else if (!strcmp(argv[i], "--remove-source-node") || !strcmp(argv[i], "-N")) {
             g_removeSourceNode = 1;
             fprintf(stderr, "CLI: --remove-source-node active; primary source /dev/input/event* will be removed after capture\n");
@@ -797,9 +806,15 @@ static void* doPollForDevicesThread(void* arg)
          }
          return 1;
      }
+     /* Create Mantis-compatible controller (no INPUT_PROP_DIRECT) */
+     if (create_mantis_controller(&mantisControllerFd) < 0) {
+         fprintf(stderr, "[GammaPad] create_mantis_controller => fail (non-fatal).\n");
+         /* Non-fatal - continue without Mantis controller */
+     }
      if (create_virtual_mouse(&mouseFd) < 0) {
          fprintf(stderr, "[GammaPad] create_virtual_mouse => fail.\n");
          destroy_virtual_device(controllerFd);
+         destroy_virtual_device(mantisControllerFd);
          for (int i = 0; i < g_physCount; i++) {
              if (g_physFds[i] >= 0) {
                  close(g_physFds[i]);
@@ -815,7 +830,8 @@ static void* doPollForDevicesThread(void* arg)
      }
 
      fprintf(stderr, "GammaPad Virtual Controller (fd=%d)\n", controllerFd);
-     fprintf(stderr, "GammaPad Virtual Mouse       (fd=%d)\n", mouseFd);
+     fprintf(stderr, "GammaPad Mantis Controller  (fd=%d)\n", mantisControllerFd);
+     fprintf(stderr, "GammaPad Virtual Mouse      (fd=%d)\n", mouseFd);
 
      //
      // === set up epoll BEFORE rebind/reopen ===
@@ -849,8 +865,11 @@ static void* doPollForDevicesThread(void* arg)
      }
 
      pthread_t pollThread;
+     int pollThreadCreated = 0;
      if (pthread_create(&pollThread, NULL, doPollForDevicesThread, NULL) != 0) {
          fprintf(stderr, "[GammaPad] Could not create poll thread => no re-capture logic.\n");
+     } else {
+         pollThreadCreated = 1;
      }
 
     //
@@ -993,7 +1012,9 @@ static void* doPollForDevicesThread(void* arg)
 
      close(g_epfd);
      g_shouldExit = 1;
-     pthread_join(pollThread, NULL);
+     if (pollThreadCreated) {
+         pthread_join(pollThread, NULL);
+     }
      for(int i = 0; i < g_physCount; i++){
          if(g_physFds[i] >= 0){
              ioctl(g_physFds[i], EVIOCGRAB, 0);
@@ -1008,6 +1029,7 @@ static void* doPollForDevicesThread(void* arg)
          g_hasPhysicalFF = 0;
      }
      destroy_virtual_device(mouseFd);
+     destroy_virtual_device(mantisControllerFd);
      destroy_virtual_device(controllerFd);
      fprintf(stderr, "[GammaPad] Exiting.\n");
      return 0;

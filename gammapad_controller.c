@@ -292,6 +292,130 @@ int create_virtual_controller(int* fd_out) {
 }
 
 /*
+ * create_mantis_controller => creates a Mantis-compatible controller
+ * without INPUT_PROP_DIRECT and without force feedback.
+ * This ensures Mantis and similar apps see a gamepad they recognize.
+ */
+int create_mantis_controller(int* fd_out) {
+    if (!fd_out) return -1;
+    int fd = open("/dev/uinput", O_WRONLY|O_NONBLOCK);
+    if (fd < 0) {
+        LOG_FF("create_mantis_controller: open => %s\n", strerror(errno));
+        return -1;
+    }
+
+    /* Core bits - NO INPUT_PROP_DIRECT */
+    ioctl(fd, UI_SET_EVBIT, EV_KEY);
+    ioctl(fd, UI_SET_EVBIT, EV_ABS);
+    ioctl(fd, UI_SET_EVBIT, EV_SYN);
+    ioctl(fd, UI_SET_PROPBIT, INPUT_PROP_BUTTONPAD);
+
+    /* Enable keys and axes based on discovered scancodes */
+    enableDiscoveredKeys(fd);
+    enableDiscoveredAxes(fd);
+
+    /* Always advertise BTN_GAMEPAD and core gamepad buttons for compatibility */
+    ioctl(fd, UI_SET_KEYBIT, BTN_GAMEPAD);
+    ioctl(fd, UI_SET_KEYBIT, BTN_A);
+    ioctl(fd, UI_SET_KEYBIT, BTN_B);
+    ioctl(fd, UI_SET_KEYBIT, BTN_X);
+    ioctl(fd, UI_SET_KEYBIT, BTN_Y);
+
+    /* If we emulate GAS/BRAKE, ensure BTN_TL2/BTN_TR2 are advertised */
+    if (g_gas_brake_emulation) {
+        ioctl(fd, UI_SET_KEYBIT, BTN_TL2);
+        ioctl(fd, UI_SET_KEYBIT, BTN_TR2);
+    }
+
+    /* Advertise every user-mapped destination code */
+    for (int sc = 0; sc <= KEY_MAX; sc++) {
+        int dst = g_customKeyMap[sc];
+        if (dst >= 0) {
+            ioctl(fd, UI_SET_KEYBIT, dst);
+        }
+    }
+
+    struct uinput_user_dev uidev;
+    memset(&uidev, 0, sizeof(uidev));
+    snprintf(uidev.name, UINPUT_MAX_NAME_SIZE, "%s (Mantis)", g_uiname);
+    /* Use USB bus and different product ID to avoid conflicting with main Bluetooth Xbox controller */
+    uidev.id.bustype = BUS_USB;
+    uidev.id.vendor  = g_uivid;
+    uidev.id.product = 0x02fe;  /* Different from main controller's 0x02fd */
+    uidev.id.version = g_uiversion;
+    /* No FF for Mantis controller */
+    uidev.ff_effects_max = 0;
+
+    /* GAS/BRAKE emulation */
+    if (g_gas_brake_emulation) {
+        ioctl(fd, UI_SET_ABSBIT, ABS_BRAKE);
+        ioctl(fd, UI_SET_ABSBIT, ABS_GAS);
+        if (!g_discoveredAxes[ABS_BRAKE]) {
+            uidev.absmin[ABS_BRAKE] = 0;
+            uidev.absmax[ABS_BRAKE] = 16384;
+        }
+        if (!g_discoveredAxes[ABS_GAS]) {
+            uidev.absmin[ABS_GAS] = 0;
+            uidev.absmax[ABS_GAS] = 16384;
+        }
+    }
+
+    /* fallback ranges */
+    setAbsRange(&uidev, ABS_X,     -1800, 1800);
+    setAbsRange(&uidev, ABS_Y,     -1800, 1800);
+    setAbsRange(&uidev, ABS_Z,     -1800, 1800);
+    setAbsRange(&uidev, ABS_RX,    -1800, 1800);
+    setAbsRange(&uidev, ABS_RY,    -1800, 1800);
+    setAbsRange(&uidev, ABS_BRAKE,     0, 255);
+    setAbsRange(&uidev, ABS_GAS,       0, 255);
+    setAbsRange(&uidev, ABS_HAT0X,    -1,    1);
+    setAbsRange(&uidev, ABS_HAT0Y,    -1,    1);
+
+    /* Remap destinations */
+    int remapDest[ABS_MAX + 1];
+    memset(remapDest, 0, sizeof(remapDest));
+    for (int src = 0; src <= ABS_MAX; ++src) {
+        int dst = g_absRemap[src];
+        if (dst >= 0 && dst <= ABS_MAX) {
+            remapDest[dst] = 1;
+        }
+    }
+
+    /* override with real min/max */
+    for (int sc = 0; sc <= ABS_MAX; sc++) {
+        if (g_discoveredAxes[sc]) {
+            int axis = g_absMap[sc];
+            if (axis < 0 || axis > ABS_MAX)
+                continue;
+
+            int outAxis = axis;
+            if (g_absRemap[axis] >= 0 && g_absRemap[axis] <= ABS_MAX) {
+                outAxis = g_absRemap[axis];
+            } else if (remapDest[axis]) {
+                continue;
+            }
+
+            uidev.absmin[outAxis]  = getPhysicalAbsMin(sc);
+            uidev.absmax[outAxis]  = getPhysicalAbsMax(sc);
+            uidev.absfuzz[outAxis] = getPhysicalAbsFuzz(sc);
+            uidev.absflat[outAxis] = getPhysicalAbsFlat(sc);
+        }
+    }
+
+    if (write(fd, &uidev, sizeof(uidev)) < 0 ||
+        ioctl(fd, UI_DEV_CREATE) < 0)
+    {
+        LOG_FF("create_mantis_controller: UI_DEV_CREATE => %s\n", strerror(errno));
+        close(fd);
+        return -1;
+    }
+
+    LOG_FF("create_mantis_controller: success fd=%d\n", fd);
+    *fd_out = fd;
+    return 0;
+}
+
+/*
  * create_virtual_mouse => same as before.
  */
 int create_virtual_mouse(int* fd_out)
