@@ -22,8 +22,10 @@
 
 /* External globals and functions from your project */
 extern int controllerFd;
+extern int mantisControllerFd;
 extern void destroy_virtual_device(int fd);
 extern int create_virtual_controller(int *fd_out);
+extern int create_mantis_controller(int *fd_out);
 
 extern char* g_uiname;
 extern int g_uibus;
@@ -658,12 +660,16 @@ static void update_parameter(const char *filename, const char *new_value) {
         if (controllerFd >= 0) {
             destroy_virtual_device(controllerFd);
         }
+        if (mantisControllerFd >= 0) {
+            destroy_virtual_device(mantisControllerFd);
+        }
         if (create_virtual_controller(&controllerFd) < 0) {
             fprintf(stderr, "Failed to recreate virtual controller with new uiname\n");
         } else {
             fprintf(stderr, "Recreated virtual controller with new uiname: %s\n", g_uiname);
             aggregatorReuploadAllEffects();
         }
+        create_mantis_controller(&mantisControllerFd);
     }
     else if (strcmp(filename, "uibus") == 0) {
         int new_bus = atoi(new_value);
@@ -673,12 +679,16 @@ static void update_parameter(const char *filename, const char *new_value) {
             if (controllerFd >= 0) {
                 destroy_virtual_device(controllerFd);
             }
+            if (mantisControllerFd >= 0) {
+                destroy_virtual_device(mantisControllerFd);
+            }
             if (create_virtual_controller(&controllerFd) < 0) {
                 fprintf(stderr, "Failed to recreate virtual controller with new uibus\n");
             } else {
                 fprintf(stderr, "Recreated virtual controller with new uibus: %d\n", g_uibus);
                 aggregatorReuploadAllEffects();
             }
+            create_mantis_controller(&mantisControllerFd);
         }
     }
     else if (strcmp(filename, "uivid") == 0) {
@@ -689,12 +699,16 @@ static void update_parameter(const char *filename, const char *new_value) {
             if (controllerFd >= 0) {
                 destroy_virtual_device(controllerFd);
             }
+            if (mantisControllerFd >= 0) {
+                destroy_virtual_device(mantisControllerFd);
+            }
             if (create_virtual_controller(&controllerFd) < 0) {
                 fprintf(stderr, "Failed to recreate virtual controller with new uivid\n");
             } else {
                 fprintf(stderr, "Recreated virtual controller with new uivid: %d\n", g_uivid);
                 aggregatorReuploadAllEffects();
             }
+            create_mantis_controller(&mantisControllerFd);
         }
     }
     else if (strcmp(filename, "uiproduct") == 0) {
@@ -705,12 +719,16 @@ static void update_parameter(const char *filename, const char *new_value) {
             if (controllerFd >= 0) {
                 destroy_virtual_device(controllerFd);
             }
+            if (mantisControllerFd >= 0) {
+                destroy_virtual_device(mantisControllerFd);
+            }
             if (create_virtual_controller(&controllerFd) < 0) {
                 fprintf(stderr, "Failed to recreate virtual controller with new uiproduct\n");
             } else {
                 fprintf(stderr, "Recreated virtual controller with new uiproduct: %d\n", g_uiproduct);
                 aggregatorReuploadAllEffects();
             }
+            create_mantis_controller(&mantisControllerFd);
         }
     }
     else if (strcmp(filename, "uiversion") == 0) {
@@ -721,12 +739,16 @@ static void update_parameter(const char *filename, const char *new_value) {
             if (controllerFd >= 0) {
                 destroy_virtual_device(controllerFd);
             }
+            if (mantisControllerFd >= 0) {
+                destroy_virtual_device(mantisControllerFd);
+            }
             if (create_virtual_controller(&controllerFd) < 0) {
                 fprintf(stderr, "Failed to recreate virtual controller with new uiversion\n");
             } else {
                 fprintf(stderr, "Recreated virtual controller with new uiversion: %d\n", g_uiversion);
                 aggregatorReuploadAllEffects();
             }
+            create_mantis_controller(&mantisControllerFd);
         }
     }
     else if (strcmp(filename, "ABXY_LAYOUT") == 0) {
@@ -802,9 +824,11 @@ static void update_parameter(const char *filename, const char *new_value) {
             fprintf(stderr, "[Config] No new codes to advertise, skipping controller recreate.\n");
         } else {
             int oldFd = controllerFd;
+            int oldMantisFd = mantisControllerFd;
 
-            // 3) destroy & build a fresh uinput device
+            // 3) destroy & build fresh uinput devices
             destroy_virtual_device(oldFd);
+            destroy_virtual_device(oldMantisFd);
             if (create_virtual_controller(&controllerFd) < 0) {
                 fprintf(stderr, "[Config] Failed to recreate virtual controller after remap\n");
             } else {
@@ -820,6 +844,7 @@ static void update_parameter(const char *filename, const char *new_value) {
                 epoll_ctl(g_epfd, EPOLL_CTL_ADD, controllerFd, &ev);
                 fcntl(controllerFd, F_SETFL, O_NONBLOCK);
             }
+            create_mantis_controller(&mantisControllerFd);
         }
     }
 

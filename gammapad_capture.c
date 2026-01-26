@@ -28,8 +28,10 @@
 #include <stdio.h>
 #include <unistd.h>
 
-/* We'll rely on the global 'controllerFd' declared in gammapad_main.c. */
+/* We'll rely on the global 'controllerFd' and 'mantisControllerFd' declared in gammapad_main.c. */
 extern int controllerFd;
+extern int mantisControllerFd;
+extern int g_mantisEnabled;
 
 /*
  * We'll store:
@@ -274,7 +276,31 @@ static int identifyDriverAndDevice(const char* eventNode,
 }
 
 /*
- * unbindAndRebind => do unbind x3 + bind x3 for the primary device
+ * isDeviceBound:
+ *   Check if g_deviceName is currently bound to the driver by checking
+ *   if the device directory exists under the driver path.
+ *   Returns 1 if bound, 0 if not bound or on error.
+ */
+static int isDeviceBound(void)
+{
+    if (!gHasDriver || !g_driverPath[0] || !g_deviceName[0]) {
+        return 0;
+    }
+
+    char devicePath[512];
+    snprintf(devicePath, sizeof(devicePath), "%s/%s", g_driverPath, g_deviceName);
+
+    /* Check if the device directory exists under the driver */
+    if (access(devicePath, F_OK) == 0) {
+        fprintf(stderr, "[GammaPadCapture] isDeviceBound: '%s' exists => device is bound.\n", devicePath);
+        return 1;
+    }
+    fprintf(stderr, "[GammaPadCapture] isDeviceBound: '%s' does not exist => device is unbound.\n", devicePath);
+    return 0;
+}
+
+/*
+ * unbindAndRebind => do unbind + bind for the primary device (uses smart checks)
  */
 void unbindAndRebind(void)
 {
@@ -292,41 +318,51 @@ void unbindAndRebind(void)
         return;
     }
 
-    fprintf(stderr,"[GammaPadCapture] We'll unbind 3x + bind 3x for driver.\n");
-    // unbind x3
-    for(int i=1;i<=3;i++){
+    fprintf(stderr,"[GammaPadCapture] unbindAndRebind => using smart unbind/bind.\n");
+
+    /* Only unbind if currently bound */
+    if (isDeviceBound()) {
         char unbindPath[512];
-        snprintf(unbindPath,sizeof(unbindPath),"%s/unbind", g_driverPath);
-        FILE* fUnbind= fopen(unbindPath,"w");
-        if(!fUnbind){
-            fprintf(stderr,"[GammaPadCapture] unbind #%d => open fail => %s\n", i,strerror(errno));
+        snprintf(unbindPath, sizeof(unbindPath), "%s/unbind", g_driverPath);
+        FILE* fUnbind = fopen(unbindPath, "w");
+        if (!fUnbind) {
+            fprintf(stderr, "[GammaPadCapture] unbind => open fail => %s\n", strerror(errno));
         } else {
-            fprintf(stderr,"[GammaPadCapture] unbind #%d => writing '%s'\n",i,g_deviceName);
-            fprintf(fUnbind,"%s\n",g_deviceName);
+            fprintf(stderr, "[GammaPadCapture] unbind => writing '%s'\n", g_deviceName);
+            fprintf(fUnbind, "%s\n", g_deviceName);
             fclose(fUnbind);
         }
-        sleep(1);
+        /* Wait for kernel to clean up */
+        sleep(2);
+    } else {
+        fprintf(stderr, "[GammaPadCapture] device not bound, skipping unbind.\n");
     }
-    // bind x3
-    for(int i=1;i<=3;i++){
+
+    /* Only bind if not currently bound */
+    if (!isDeviceBound()) {
         char bindPath[512];
-        snprintf(bindPath,sizeof(bindPath),"%s/bind", g_driverPath);
-        FILE* fBind= fopen(bindPath,"w");
-        if(!fBind){
-            fprintf(stderr,"[GammaPadCapture] bind #%d => open fail => %s\n", i,strerror(errno));
+        snprintf(bindPath, sizeof(bindPath), "%s/bind", g_driverPath);
+        FILE* fBind = fopen(bindPath, "w");
+        if (!fBind) {
+            fprintf(stderr, "[GammaPadCapture] bind => open fail => %s\n", strerror(errno));
         } else {
-            fprintf(stderr,"[GammaPadCapture] bind #%d => writing '%s'\n",i,g_deviceName);
-            fprintf(fBind,"%s\n", g_deviceName);
+            fprintf(stderr, "[GammaPadCapture] bind => writing '%s'\n", g_deviceName);
+            fprintf(fBind, "%s\n", g_deviceName);
             fclose(fBind);
         }
         sleep(1);
+    } else {
+        fprintf(stderr, "[GammaPadCapture] device already bound, skipping bind.\n");
     }
-    fprintf(stderr,"[GammaPadCapture] done unbind/rebind cycles.\n");
+
+    fprintf(stderr,"[GammaPadCapture] done unbind/rebind.\n");
 }
 
 /*
  * unbindPrimaryDriver:
- *   Write g_deviceName into <driverPath>/unbind three times.
+ *   Write g_deviceName into <driverPath>/unbind, but only if device is
+ *   currently bound. Uses longer delay after unbind to allow kernel driver
+ *   to fully clean up sysfs entries.
  */
 void unbindPrimaryDriver(void)
 {
@@ -339,25 +375,45 @@ void unbindPrimaryDriver(void)
         fprintf(stderr, "[GammaPadCapture] unbindPrimaryDriver: no driver info, skipping.\n");
         return;
     }
-    fprintf(stderr, "[GammaPadCapture] unbindPrimaryDriver => unbinding driver 3×.\n");
-    for (int i = 1; i <= 3; i++) {
-        char unbindPath[512];
-        snprintf(unbindPath, sizeof(unbindPath), "%s/unbind", g_driverPath);
-        FILE* f = fopen(unbindPath, "w");
-        if (!f) {
-            fprintf(stderr, "[GammaPadCapture] unbind #%d => open fail => %s\n", i, strerror(errno));
-        } else {
-            fprintf(stderr, "[GammaPadCapture] unbind #%d => writing '%s'\n", i, g_deviceName);
-            fprintf(f, "%s\n", g_deviceName);
-            fclose(f);
-        }
-        sleep(1);
+
+    /* Check if device is actually bound before trying to unbind */
+    if (!isDeviceBound()) {
+        fprintf(stderr, "[GammaPadCapture] unbindPrimaryDriver: device not bound, skipping unbind.\n");
+        return;
+    }
+
+    fprintf(stderr, "[GammaPadCapture] unbindPrimaryDriver => attempting unbind.\n");
+    char unbindPath[512];
+    snprintf(unbindPath, sizeof(unbindPath), "%s/unbind", g_driverPath);
+    FILE* f = fopen(unbindPath, "w");
+    if (!f) {
+        fprintf(stderr, "[GammaPadCapture] unbind => open fail => %s\n", strerror(errno));
+    } else {
+        fprintf(stderr, "[GammaPadCapture] unbind => writing '%s'\n", g_deviceName);
+        fprintf(f, "%s\n", g_deviceName);
+        fclose(f);
+    }
+
+    /* Wait longer for kernel driver to fully clean up sysfs entries.
+     * The spi_joytick driver has a bug where it doesn't properly remove
+     * sysfs attributes (poll_interval etc.) on unbind, so we give it
+     * extra time to at least complete the unbind operation. */
+    sleep(2);
+
+    /* Verify unbind succeeded */
+    if (!isDeviceBound()) {
+        fprintf(stderr, "[GammaPadCapture] unbindPrimaryDriver: unbind succeeded.\n");
+    } else {
+        fprintf(stderr, "[GammaPadCapture] unbindPrimaryDriver: unbind may have failed, device still appears bound.\n");
     }
 }
 
 /*
  * bindPrimaryDriver:
- *   Write g_deviceName into <driverPath>/bind three times.
+ *   Write g_deviceName into <driverPath>/bind, but only if device is not
+ *   already bound. This works around a kernel driver bug where sysfs entries
+ *   aren't properly cleaned up on unbind, causing "duplicate filename" errors
+ *   on rebind.
  */
 void bindPrimaryDriver(void)
 {
@@ -370,19 +426,35 @@ void bindPrimaryDriver(void)
         fprintf(stderr, "[GammaPadCapture] bindPrimaryDriver: no driver info, skipping.\n");
         return;
     }
-    fprintf(stderr, "[GammaPadCapture] bindPrimaryDriver => binding driver 3×.\n");
-    for (int i = 1; i <= 3; i++) {
-        char bindPath[512];
-        snprintf(bindPath, sizeof(bindPath), "%s/bind", g_driverPath);
-        FILE* f = fopen(bindPath, "w");
-        if (!f) {
-            fprintf(stderr, "[GammaPadCapture] bind #%d => open fail => %s\n", i, strerror(errno));
-        } else {
-            fprintf(stderr, "[GammaPadCapture] bind #%d => writing '%s'\n", i, g_deviceName);
-            fprintf(f, "%s\n", g_deviceName);
-            fclose(f);
-        }
-        sleep(1);
+
+    /* Check if device is already bound - if so, skip bind to avoid
+     * kernel driver bug where joypad_probe fails with -EEXIST due to
+     * duplicate sysfs entries (poll_interval etc.) */
+    if (isDeviceBound()) {
+        fprintf(stderr, "[GammaPadCapture] bindPrimaryDriver: device already bound, skipping bind.\n");
+        return;
+    }
+
+    fprintf(stderr, "[GammaPadCapture] bindPrimaryDriver => attempting single bind.\n");
+    char bindPath[512];
+    snprintf(bindPath, sizeof(bindPath), "%s/bind", g_driverPath);
+    FILE* f = fopen(bindPath, "w");
+    if (!f) {
+        fprintf(stderr, "[GammaPadCapture] bind => open fail => %s\n", strerror(errno));
+    } else {
+        fprintf(stderr, "[GammaPadCapture] bind => writing '%s'\n", g_deviceName);
+        fprintf(f, "%s\n", g_deviceName);
+        fclose(f);
+    }
+
+    /* Wait for bind to complete */
+    sleep(1);
+
+    /* Verify bind succeeded */
+    if (isDeviceBound()) {
+        fprintf(stderr, "[GammaPadCapture] bindPrimaryDriver: bind succeeded.\n");
+    } else {
+        fprintf(stderr, "[GammaPadCapture] bindPrimaryDriver: bind may have failed, device not appearing as bound.\n");
     }
 }
 
@@ -879,6 +951,7 @@ void forward_physical_event(const struct input_event* ev)
         outKey[1].code  = SYN_REPORT;
         outKey[1].value = 0;
         write(controllerFd, outKey, sizeof(outKey));
+        if(g_mantisEnabled && mantisControllerFd >= 0) write(mantisControllerFd, outKey, sizeof(outKey));
 
         /* 2) GAS/BRAKE emulation: L2/R2 keys → ABS_BRAKE/ABS_GAS */
         if (g_gas_brake_emulation) {
@@ -898,6 +971,7 @@ void forward_physical_event(const struct input_event* ev)
                 outAbs[1].code  = SYN_REPORT;
                 outAbs[1].value = 0;
                 write(controllerFd, outAbs, sizeof(outAbs));
+                if(g_mantisEnabled && mantisControllerFd >= 0) write(mantisControllerFd, outAbs, sizeof(outAbs));
             }
         }
 
@@ -1018,6 +1092,7 @@ void forward_physical_event(const struct input_event* ev)
                     out[1].code  = SYN_REPORT;
                     out[1].value = 0;
                     write(controllerFd, out, sizeof(out));
+                    if(g_mantisEnabled && mantisControllerFd >= 0) write(mantisControllerFd, out, sizeof(out));
                     return;
                 }
                 /* Analog → DPAD */
@@ -1042,6 +1117,7 @@ void forward_physical_event(const struct input_event* ev)
                     out[1].code  = SYN_REPORT;
                     out[1].value = 0;
                     write(controllerFd, out, sizeof(out));
+                    if(g_mantisEnabled && mantisControllerFd >= 0) write(mantisControllerFd, out, sizeof(out));
                     return;
                 }
             }
@@ -1066,6 +1142,7 @@ void forward_physical_event(const struct input_event* ev)
                     k[0].type = EV_KEY; k[0].code = BTN_TL2; k[0].value = want_down;
                     k[1].type = EV_SYN; k[1].code = SYN_REPORT; k[1].value = 0;
                     write(controllerFd, k, sizeof(k));
+                    if(g_mantisEnabled && mantisControllerFd >= 0) write(mantisControllerFd, k, sizeof(k));
                     tl2_down = want_down;
                     LOG_FF("[EMU] ABS_BRAKE=%d → BTN_TL2=%d (on=%d%% off=%d%%)\n",
                            ev_val, tl2_down, 80, 60);
@@ -1081,6 +1158,7 @@ void forward_physical_event(const struct input_event* ev)
                     k[0].type = EV_KEY; k[0].code = BTN_TR2; k[0].value = want_down;
                     k[1].type = EV_SYN; k[1].code = SYN_REPORT; k[1].value = 0;
                     write(controllerFd, k, sizeof(k));
+                    if(g_mantisEnabled && mantisControllerFd >= 0) write(mantisControllerFd, k, sizeof(k));
                     tr2_down = want_down;
                     LOG_FF("[EMU] ABS_GAS=%d → BTN_TR2=%d (on=%d%% off=%d%%)\n",
                            ev_val, tr2_down, 80, 60);
@@ -1112,6 +1190,7 @@ void forward_physical_event(const struct input_event* ev)
         out[1].code  = SYN_REPORT;
         out[1].value = 0;
         write(controllerFd, out, sizeof(out));
+        if(g_mantisEnabled && mantisControllerFd >= 0) write(mantisControllerFd, out, sizeof(out));
 
         /* 5) Record for next deadzone calc */
         last_processed_abs[sc] = ev_val;
