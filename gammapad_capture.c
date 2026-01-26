@@ -31,6 +31,7 @@
 /* We'll rely on the global 'controllerFd' and 'mantisControllerFd' declared in gammapad_main.c. */
 extern int controllerFd;
 extern int mantisControllerFd;
+extern int g_mantisEnabled;
 
 /*
  * We'll store:
@@ -950,7 +951,7 @@ void forward_physical_event(const struct input_event* ev)
         outKey[1].code  = SYN_REPORT;
         outKey[1].value = 0;
         write(controllerFd, outKey, sizeof(outKey));
-        if(mantisControllerFd >= 0) write(mantisControllerFd, outKey, sizeof(outKey));
+        if(g_mantisEnabled && mantisControllerFd >= 0) write(mantisControllerFd, outKey, sizeof(outKey));
 
         /* 2) GAS/BRAKE emulation: L2/R2 keys → ABS_BRAKE/ABS_GAS */
         if (g_gas_brake_emulation) {
@@ -970,7 +971,7 @@ void forward_physical_event(const struct input_event* ev)
                 outAbs[1].code  = SYN_REPORT;
                 outAbs[1].value = 0;
                 write(controllerFd, outAbs, sizeof(outAbs));
-                if(mantisControllerFd >= 0) write(mantisControllerFd, outAbs, sizeof(outAbs));
+                if(g_mantisEnabled && mantisControllerFd >= 0) write(mantisControllerFd, outAbs, sizeof(outAbs));
             }
         }
 
@@ -1091,7 +1092,7 @@ void forward_physical_event(const struct input_event* ev)
                     out[1].code  = SYN_REPORT;
                     out[1].value = 0;
                     write(controllerFd, out, sizeof(out));
-                    if(mantisControllerFd >= 0) write(mantisControllerFd, out, sizeof(out));
+                    if(g_mantisEnabled && mantisControllerFd >= 0) write(mantisControllerFd, out, sizeof(out));
                     return;
                 }
                 /* Analog → DPAD */
@@ -1116,7 +1117,7 @@ void forward_physical_event(const struct input_event* ev)
                     out[1].code  = SYN_REPORT;
                     out[1].value = 0;
                     write(controllerFd, out, sizeof(out));
-                    if(mantisControllerFd >= 0) write(mantisControllerFd, out, sizeof(out));
+                    if(g_mantisEnabled && mantisControllerFd >= 0) write(mantisControllerFd, out, sizeof(out));
                     return;
                 }
             }
@@ -1141,7 +1142,7 @@ void forward_physical_event(const struct input_event* ev)
                     k[0].type = EV_KEY; k[0].code = BTN_TL2; k[0].value = want_down;
                     k[1].type = EV_SYN; k[1].code = SYN_REPORT; k[1].value = 0;
                     write(controllerFd, k, sizeof(k));
-                    if(mantisControllerFd >= 0) write(mantisControllerFd, k, sizeof(k));
+                    if(g_mantisEnabled && mantisControllerFd >= 0) write(mantisControllerFd, k, sizeof(k));
                     tl2_down = want_down;
                     LOG_FF("[EMU] ABS_BRAKE=%d → BTN_TL2=%d (on=%d%% off=%d%%)\n",
                            ev_val, tl2_down, 80, 60);
@@ -1157,7 +1158,7 @@ void forward_physical_event(const struct input_event* ev)
                     k[0].type = EV_KEY; k[0].code = BTN_TR2; k[0].value = want_down;
                     k[1].type = EV_SYN; k[1].code = SYN_REPORT; k[1].value = 0;
                     write(controllerFd, k, sizeof(k));
-                    if(mantisControllerFd >= 0) write(mantisControllerFd, k, sizeof(k));
+                    if(g_mantisEnabled && mantisControllerFd >= 0) write(mantisControllerFd, k, sizeof(k));
                     tr2_down = want_down;
                     LOG_FF("[EMU] ABS_GAS=%d → BTN_TR2=%d (on=%d%% off=%d%%)\n",
                            ev_val, tr2_down, 80, 60);
@@ -1189,7 +1190,7 @@ void forward_physical_event(const struct input_event* ev)
         out[1].code  = SYN_REPORT;
         out[1].value = 0;
         write(controllerFd, out, sizeof(out));
-        if(mantisControllerFd >= 0) write(mantisControllerFd, out, sizeof(out));
+        if(g_mantisEnabled && mantisControllerFd >= 0) write(mantisControllerFd, out, sizeof(out));
 
         /* 5) Record for next deadzone calc */
         last_processed_abs[sc] = ev_val;

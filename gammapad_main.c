@@ -29,6 +29,10 @@
  #include <limits.h>
  #include <stdlib.h>
  #include <ctype.h>
+
+ #ifdef __ANDROID__
+ #include <sys/system_properties.h>
+ #endif
  
  #define MAX_ACTIVE_EVENTS 64
  #define EPOLL_MAX_EVENTS  16
@@ -59,6 +63,7 @@
   */
  int controllerFd = -1;
  int mantisControllerFd = -1;
+ int g_mantisEnabled = 1; /* runtime toggle: 1 = forward events to mantis, 0 = skip */
  int mouseFd = -1;
  int g_physicalFd = -1;
  
@@ -190,7 +195,7 @@ int g_absRemap[ABS_MAX + 1];
      ev[1].code = SYN_REPORT;
      ev[1].value = 0;
      write(controllerFd, &ev, sizeof(ev));
-     if(mantisControllerFd >= 0) write(mantisControllerFd, &ev, sizeof(ev));
+     if(g_mantisEnabled && mantisControllerFd >= 0) write(mantisControllerFd, &ev, sizeof(ev));
  }
 
  void scheduleEvent(int code, int isKey, int value, unsigned long long durationMs)
@@ -221,9 +226,36 @@ int g_absRemap[ABS_MAX + 1];
      ev[1].code = SYN_REPORT;
      ev[1].value = 0;
      write(controllerFd, &ev, sizeof(ev));
-     if(mantisControllerFd >= 0) write(mantisControllerFd, &ev, sizeof(ev));
+     if(g_mantisEnabled && mantisControllerFd >= 0) write(mantisControllerFd, &ev, sizeof(ev));
  }
- 
+
+ /*
+  * checkMantisProperty(): read persist.gammaos.mantis and update g_mantisEnabled
+  */
+ static void checkMantisProperty(void)
+ {
+ #ifdef __ANDROID__
+     static unsigned long long lastCheckMs = 0;
+     unsigned long long now = getTimeMs();
+
+     /* Only check every 500ms to avoid overhead */
+     if (now - lastCheckMs < 500) return;
+     lastCheckMs = now;
+
+     char value[PROP_VALUE_MAX] = {0};
+     int len = __system_property_get("persist.gammaos.mantis", value);
+
+     if (len > 0) {
+         int newEnabled = (strcmp(value, "off") != 0); /* default to enabled unless "off" */
+         if (newEnabled != g_mantisEnabled) {
+             g_mantisEnabled = newEnabled;
+             fprintf(stderr, "[GammaPad] Mantis controller %s (from property)\n",
+                     g_mantisEnabled ? "enabled" : "disabled");
+         }
+     }
+ #endif
+ }
+
  /*
   * checkEventTimeouts(): auto-release events that have expired.
   */
@@ -959,6 +991,7 @@ static void* doPollForDevicesThread(void* arg)
 
     while (!g_shouldExit) {
         checkEventTimeouts();
+        checkMantisProperty();
 
         int n = epoll_wait(g_epfd, events, EPOLL_MAX_EVENTS, 500);
         if (n < 0) {

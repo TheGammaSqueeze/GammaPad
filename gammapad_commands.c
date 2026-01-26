@@ -4,6 +4,9 @@
 /* External function to schedule events (declared in gammapad_main.c). */
 extern void scheduleEvent(int code, int isKey, int value, unsigned long long durationMs);
 
+/* External: g_mantisEnabled toggle */
+extern int g_mantisEnabled;
+
 /*
  * parseCommand:
  * -------------
@@ -22,6 +25,17 @@ void parseCommand(const char* line)
         return;
     }
     if (!strcasecmp(cmd, "exit")) {
+        return;
+    }
+    /* mantis on/off: toggle forwarding events to mantis controller */
+    if (!strcasecmp(cmd, "mantis") && parts >= 2) {
+        if (!strcasecmp(arg1, "on") || !strcasecmp(arg1, "1")) {
+            g_mantisEnabled = 1;
+            fprintf(stderr, "[GammaPad] Mantis controller enabled\n");
+        } else if (!strcasecmp(arg1, "off") || !strcasecmp(arg1, "0")) {
+            g_mantisEnabled = 0;
+            fprintf(stderr, "[GammaPad] Mantis controller disabled\n");
+        }
         return;
     }
     if (!strcasecmp(cmd, "press") && parts >= 2) {

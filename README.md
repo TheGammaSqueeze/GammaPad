@@ -127,3 +127,38 @@ The Mantis controller uses `BUS_USB` and a different product ID (`0x02fe`) to pr
 
 ## Events
 Both controllers receive the same input events, so either can be used depending on which one the application detects.
+
+## Mantis Toggle (Duplicate Input Prevention)
+
+### Problem
+When both virtual controllers are active and an application (or the system) sees both, key presses can be registered twice - once from each controller.
+
+### Solution
+A runtime toggle `g_mantisEnabled` controls whether events are forwarded to the Mantis controller.
+
+### Runtime Command
+Send commands to GammaPad's stdin to toggle the Mantis controller:
+
+```bash
+# Disable Mantis controller (single controller mode - prevents duplicate inputs)
+echo "mantis off" | ...
+
+# Enable Mantis controller (dual controller mode)
+echo "mantis on" | ...
+```
+
+### System Property (Android)
+On GammaOS/Android, GammaPad polls the system property `persist.gammaos.mantis` every 500ms:
+
+- `persist.gammaos.mantis=on` - Mantis controller enabled (default)
+- `persist.gammaos.mantis=off` - Mantis controller disabled
+
+This allows the Quick Settings tile or other system components to control the Mantis controller without sending commands directly to GammaPad's stdin.
+
+### Quick Settings Integration
+On GammaOS, a "Mantis" Quick Settings tile is available that toggles this property. When toggled:
+- **Mantis On**: Both controllers receive events (for Mantis Gamepad Pro compatibility)
+- **Mantis Off**: Only the main controller receives events (prevents duplicate inputs)
+
+### Default Behavior
+By default, `g_mantisEnabled = 1`, so both controllers receive events. This maintains backward compatibility with existing setups that rely on the Mantis controller.
