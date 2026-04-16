@@ -77,6 +77,10 @@
  int g_noSourceRebind = 0; /* default: perform unbind/rebind */
  int g_removeSourceNode = 0; /* default: keep source node present */
 
+ /* Wake debounce: default 500ms suppression after sleep/resume */
+ volatile unsigned long long g_wakeTimestampMs = 0;
+ int g_wakeDebounceMs = 500;
+
  /* New virtual controller parameters – defaults */
  char* g_uiname = NULL;  // Will be set to default via strdup if not provided
  int g_uibus = BUS_BLUETOOTH;

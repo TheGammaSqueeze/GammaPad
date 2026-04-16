@@ -111,6 +111,8 @@ static int last_processed_abs[ABS_MAX+1] = {0};
 /*
  * recapture_primary_post_actions:
  *   Called when the primary device is re-captured (e.g., after sleep/resume).
+ *   - Record wake timestamp for debounce (Issue #249 fix).
+ *   - Force all analog axes to center to flush stale ADC values.
  *   - Update the stored primary event node path.
  *   - If --remove-source-node is active, remove the node again to mimic
  *     initial-capture behavior.
@@ -118,6 +120,55 @@ static int last_processed_abs[ABS_MAX+1] = {0};
 void recapture_primary_post_actions(const char* device_path)
 {
     if (!device_path || !device_path[0]) return;
+
+    /*
+     * Issue #249 fix: Record the wake timestamp so forward_physical_event()
+     * can suppress stale EV_ABS events during the ADC stabilization window.
+     */
+    g_wakeTimestampMs = getTimeMs();
+    fprintf(stderr,
+            "[GammaPadCapture] Wake/recapture detected — debouncing ABS events for %dms\n",
+            g_wakeDebounceMs);
+
+    /*
+     * Force all analog axes to their center value on the virtual controller.
+     * This immediately clears any stale axis state that Android may have
+     * cached from before sleep, preventing phantom scrolling on unlock.
+     */
+    if (controllerFd >= 0) {
+        static const int axes_to_center[] = {
+            ABS_X, ABS_Y, ABS_Z, ABS_RZ, ABS_RX, ABS_RY,
+            ABS_GAS, ABS_BRAKE, ABS_HAT0X, ABS_HAT0Y
+        };
+        int num_axes = (int)(sizeof(axes_to_center) / sizeof(axes_to_center[0]));
+        for (int i = 0; i < num_axes; i++) {
+            int sc = axes_to_center[i];
+            int mn = getPhysicalAbsMin(sc);
+            int mx = getPhysicalAbsMax(sc);
+            int center = (mn + mx) / 2;
+            struct input_event out[2];
+            memset(out, 0, sizeof(out));
+            out[0].type  = EV_ABS;
+            out[0].code  = sc;
+            out[0].value = center;
+            out[1].type  = EV_SYN;
+            out[1].code  = SYN_REPORT;
+            out[1].value = 0;
+            write(controllerFd, out, sizeof(out));
+        }
+        fprintf(stderr,
+                "[GammaPadCapture] Forced %d axes to center on virtual controller\n",
+                num_axes);
+    }
+
+    /* Reset last_processed_abs to center so deadzone calculations
+     * don't use stale pre-sleep values on the next real event. */
+    for (int i = 0; i <= ABS_MAX; i++) {
+        int mn = getPhysicalAbsMin(i);
+        int mx = getPhysicalAbsMax(i);
+        last_processed_abs[i] = (mn + mx) / 2;
+    }
+
     memset(g_physicalDevicePath, 0, sizeof(g_physicalDevicePath));
     strncpy(g_physicalDevicePath, device_path, sizeof(g_physicalDevicePath) - 1);
     if (g_removeSourceNode) {
@@ -846,6 +897,36 @@ int open_physical_device(const char* device_path)
 void forward_physical_event(const struct input_event* ev)
 {
     if (!ev || controllerFd < 0) return;
+
+    /*
+     * Issue #249 fix: Wake debounce.
+     *
+     * After a sleep/resume transition, the physical device's ADC may report
+     * stale or noisy axis values for a brief period.  These manifest as
+     * phantom scrolling / ghost input (fast-scrolling through menus, phantom
+     * trigger presses, etc.).
+     *
+     * We suppress all EV_ABS events for g_wakeDebounceMs after the last
+     * device recapture.  EV_KEY events (buttons) are allowed through so that
+     * the power button and face buttons remain responsive during wake.
+     *
+     * See: https://github.com/TheGammaSqueeze/GammaOSNext/issues/249
+     */
+    if (g_wakeTimestampMs > 0 && ev->type == EV_ABS) {
+        unsigned long long now = getTimeMs();
+        unsigned long long elapsed = now - g_wakeTimestampMs;
+        if (elapsed < (unsigned long long)g_wakeDebounceMs) {
+            /* Still inside the debounce window — drop this analog event */
+            return;
+        }
+        /* Debounce window has expired — resume normal forwarding.
+         * Clear the timestamp so we skip this check on future events
+         * until the next recapture. */
+        g_wakeTimestampMs = 0;
+        fprintf(stderr,
+                "[GammaPadCapture] Wake debounce expired after %llums — resuming ABS forwarding\n",
+                elapsed);
+    }
 
     if (ev->type == EV_KEY) {
         int sc     = ev->code;
