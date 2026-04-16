@@ -609,6 +609,34 @@ static void load_initial_config(void) {
     }
     pthread_mutex_unlock(&config_mutex);
 
+    /* WAKE_DEBOUNCE_MS: integer 0..2000 (Issue #249 fix) */
+    snprintf(filepath, sizeof(filepath), "%s/%s", CONFIG_DIR, "WAKE_DEBOUNCE_MS");
+    f = fopen(filepath, "r");
+    pthread_mutex_lock(&config_mutex);
+    if (f) {
+        if (fgets(buf, sizeof(buf), f)) {
+            int v = atoi(buf);
+            if (v < 0) v = 0;
+            if (v > 2000) v = 2000;
+            g_wakeDebounceMs = v;
+            fprintf(stderr, "Loaded persistent WAKE_DEBOUNCE_MS: %dms\n", g_wakeDebounceMs);
+        }
+        fclose(f);
+        chmod(filepath, 0777);
+    } else {
+        f = fopen(filepath, "w");
+        if (f) {
+            fprintf(f, "%d\n", g_wakeDebounceMs);
+            fclose(f);
+            chmod(filepath, 0777);
+            fprintf(stderr, "Created persistent WAKE_DEBOUNCE_MS file with value: %dms\n",
+                    g_wakeDebounceMs);
+        } else {
+            perror("fopen WAKE_DEBOUNCE_MS for writing");
+        }
+    }
+    pthread_mutex_unlock(&config_mutex);
+
     {
         const char *files[] = {
             MAPPINGS_FILE,
@@ -618,7 +646,8 @@ static void load_initial_config(void) {
             "LEFTSTICKINVERT", "RIGHTSTICKINVERT",
             "RIGHTSTICKINVERT_Z_RZ",
             "ANALOGSENSITIVITY", "DEADZONE",
-            "CALIBRATION_MODE"
+            "CALIBRATION_MODE",
+            "WAKE_DEBOUNCE_MS"
         };
         char fp[PATH_MAX];
         for (size_t i = 0; i < sizeof(files)/sizeof(files[0]); i++) {
@@ -772,6 +801,13 @@ static void update_parameter(const char *filename, const char *new_value) {
         if (v > 100) v = 100;
         g_deadzone = v;
         fprintf(stderr, "Updated DEADZONE to %d%%\n", g_deadzone);
+    }
+    else if (strcmp(filename, "WAKE_DEBOUNCE_MS") == 0) {
+        int v = atoi(new_value);
+        if (v < 0) v = 0;
+        if (v > 2000) v = 2000;
+        g_wakeDebounceMs = v;
+        fprintf(stderr, "Updated WAKE_DEBOUNCE_MS to %dms\n", g_wakeDebounceMs);
     }
     else if (strcmp(filename, MAPPINGS_FILE) == 0) {
         fprintf(stderr, "[Config] MAPPINGS modified; reloading.\n");

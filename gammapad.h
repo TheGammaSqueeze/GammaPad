@@ -121,4 +121,17 @@ extern int g_noSourceRebind;
 /* Runtime toggle: remove the primary /dev/input/event* node after capture */
 extern int g_removeSourceNode;
 
+/*
+ * Wake debounce: suppress stale analog input after sleep/resume.
+ *
+ * When a device recapture is detected (sleep → wake transition), we record
+ * the current timestamp.  forward_physical_event() then suppresses EV_ABS
+ * events until g_wakeDebounceMs milliseconds have elapsed, preventing
+ * phantom scrolling caused by stale ADC values in the kernel input buffer.
+ *
+ * See: https://github.com/TheGammaSqueeze/GammaOSNext/issues/249
+ */
+extern volatile unsigned long long g_wakeTimestampMs;
+extern int g_wakeDebounceMs;
+
 #endif /* GAMMAPAD_H */
